@@ -3,7 +3,7 @@ from langchain_core.documents import Document
 
 from app.core.logger_handler import logger
 from app.utils.path_tool import get_abstract_path
-from langchain_community.document_loaders import PyPDFLoader, TextLoader, UnstructuredPDFLoader, UnstructuredMarkdownLoader, UnstructuredPowerPointLoader
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, UnstructuredPDFLoader, UnstructuredMarkdownLoader, UnstructuredPowerPointLoader, UnstructuredWordDocumentLoader
 
 class FontBBoxStreamFilter:
     def __init__(self, stream):
@@ -125,7 +125,8 @@ async def word_loader(file_path: str) -> list[Document]:
     """
     abs_file_path = get_abstract_path(file_path) if not os.path.isabs(file_path) else file_path
     try:
-        loader = TextLoader(abs_file_path, encoding='utf-8')
+        # DOCX 是 OOXML ZIP 包，不能按 UTF-8 文本读取；与 pptx 一致使用 Unstructured。
+        loader = UnstructuredWordDocumentLoader(abs_file_path, mode="single")
         return await asyncio.to_thread(loader.load)
     except Exception as e:
         logger.error(f"【WORD文件加载】加载文件 {abs_file_path} 时出错: {e}")
@@ -238,7 +239,8 @@ def word_loader_sync(file_path: str) -> list[Document]:
     """
     abs_file_path = get_abstract_path(file_path) if not os.path.isabs(file_path) else file_path
     try:
-        loader = TextLoader(abs_file_path, encoding='utf-8')
+        # DOCX 是 OOXML ZIP 包，不能按 UTF-8 文本读取；与 pptx 一致使用 Unstructured。
+        loader = UnstructuredWordDocumentLoader(abs_file_path, mode="single")
         return loader.load()
     except Exception as e:
         logger.error(f"【WORD文件加载】加载文件 {abs_file_path} 时出错: {e}")
