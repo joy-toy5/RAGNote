@@ -84,6 +84,73 @@ class VectorStoreService:
         self.hybrid_retriever = HybridRetriever(self.vectors_store)
         self.document_processor = DocumentProcessor(self.vectors_store, self.md5_store)
 
+    @classmethod
+    def for_explicit_target(
+        cls,
+        *,
+        persist_directory: str,
+        collection_name: str,
+        embedding_function,
+        top_k: int,
+        fusion_weights: tuple[float, float] | list[float] | None = None,
+    ) -> "VectorStoreService":
+        """
+        构造一个绕过单例、指向显式目标的只读检索实例（离线评测用）。
+
+        与单例路径的区别，以及为什么必须有这个区别：
+        - 不写 cls._instance / cls._initialized，因此不污染生产单例；
+        - 不调用 _clear_chroma_cache()，因为清空 SharedSystemClient 缓存会影响
+          同进程内其他仍然存活的 client；
+        - 不构造 MD5Store / DocumentProcessor，所以任何误用的写入/摄取路径会
+          直接 AttributeError 失败，而不是静默写进评测索引；
+        - k 与 fusion_weights 显式传入 HybridRetriever，否则 retrieval_config
+          里声明的 top_k / 权重与实际行为不一致，attestation 就是假的。
+
+        调用方必须在用完后调用 close()：每次构造 Chroma 都会让 chromadb
+        SharedSystemClient 的 refcount +2，GC 不会回收，只有 close() 会减。
+        """
+        if not isinstance(persist_directory, str) or not persist_directory.strip():
+            raise ValueError("显式检索目标必须提供持久化目录")
+        if not isinstance(collection_name, str) or not collection_name.strip():
+            raise ValueError("显式检索目标必须提供 collection 名称")
+        if embedding_function is None:
+            raise ValueError("显式检索目标必须提供 embedding function")
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+            raise ValueError("显式检索目标的 top_k 必须是正整数")
+
+        instance = object.__new__(cls)
+        instance.vectors_store = Chroma(
+            collection_name=collection_name,
+            embedding_function=embedding_function,
+            persist_directory=persist_directory,
+        )
+        instance.md5_store = None
+        instance.document_processor = None
+        instance.hybrid_retriever = HybridRetriever(
+            instance.vectors_store,
+            k=top_k,
+            fusion_weights=fusion_weights,
+        )
+        return instance
+
+    def close(self) -> None:
+        """
+        释放底层 chromadb client。
+
+        只有显式构造的实例才应该被关闭；生产单例的 client 由进程生命周期管理，
+        关闭它会让后续所有检索失效。
+        """
+        if VectorStoreService._instance is self:
+            raise RuntimeError("不能关闭生产单例的向量库 client")
+        store = getattr(self, "vectors_store", None)
+        client = getattr(store, "_client", None)
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception as e:
+            logger.warning(f"【向量数据库】关闭显式 client 时出错: {e}")
+
     async def get_bm25_retriever(self, user_id: str):
         return await self.hybrid_retriever.get_bm25_retriever(user_id)
 
@@ -93,9 +160,10 @@ class VectorStoreService:
     async def get_retriever(self, query: str | None, user_id: str):
         return await self.hybrid_retriever.get_retriever(query, user_id)
 
-    @staticmethod
-    async def get_dynamic_weights(query: str = None):
-        return await HybridRetriever.get_dynamic_weights(query)
+    async def get_dynamic_weights(self, query: str = None):
+        # 委托给实例：权重现在是 HybridRetriever 的实例状态（可被离线消融显式
+        # 覆盖），不再是静态启发式。
+        return await self.hybrid_retriever.get_dynamic_weights(query)
 
     async def check_md5_hex(self, md5_for_check: str, user_id: str = None) -> bool:
         return await self.md5_store.check_md5_hex(md5_for_check, user_id)

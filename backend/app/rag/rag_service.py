@@ -20,9 +20,29 @@ from app.services.note_service import note_service
 
 
 class RagService:
-    def __init__(self, user_id: str = None, thinking_callback=None):
-        self.vector_store = VectorStoreService()
-        self.note_service = note_service
+    def __init__(
+        self,
+        user_id: str = None,
+        thinking_callback=None,
+        *,
+        vector_store=None,
+        note_service_override=None,
+    ):
+        """
+        :param vector_store: 显式注入的向量库服务；为 None 时使用生产单例。
+                             离线评测注入 VectorStoreService.for_explicit_target(...)，
+                             避免读到生产索引。
+        :param note_service_override: 显式注入的笔记服务；为 None 时使用生产单例。
+                             离线评测必须注入空实现：笔记候选没有 provenance 元数据，
+                             会让 execution_from_trace 拒绝整条 Query。
+        """
+        self.vector_store = (
+            vector_store if vector_store is not None else VectorStoreService()
+        )
+        self.note_service = (
+            note_service_override if note_service_override is not None
+            else note_service
+        )
         self.retriever = None
         self.user_id = user_id
         self.prompt_text = load_prompt(prompt_type="rag_summary_prompt")

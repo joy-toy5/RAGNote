@@ -9,3 +9,14 @@ allow_knowledge_file_types: ["txt", "pdf", "md", "pptx", "docx"]
 chunk_size: 200
 chunk_overlap: 20
 separators : ["\n\n", "\n", "。", "！", "？", "!", "?", " ", ""]
+
+# BM25 融合参数（RAG-005）。这些键不参与 index_version 派生 —— index_version
+# 只由 embedding 身份与 chunk_size/chunk_overlap/separators 决定，因此调这里
+# 不会失效已冻结的评测索引与 qrels。
+bm25:
+  tokenizer: cjk_bigram.v1
+  # 权重由 m3_dev_v2 消融网格选定，不是拍的：0.6/0.4 使权重比 1.5 > 80/61，
+  # 从而保证向量 top-k 必然排在任何 BM25 独有候选之前（见 _validate_weights）。
+  # 约束：bm25_weight 不得高于 vector_weight。
+  vector_weight: 0.6
+  bm25_weight: 0.4

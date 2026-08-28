@@ -165,8 +165,17 @@ def _load_hybrid_retriever(
         "langchain_classic.retrievers": _module(
             "langchain_classic.retrievers", EnsembleRetriever=object
         ),
+        # bm25 键随 RAG-005 加入：HybridRetriever 构造时读融合权重。
         "app.utils.config": _module(
-            "app.utils.config", chroma_config={"k": 3}
+            "app.utils.config",
+            chroma_config={
+                "k": 3,
+                "bm25": {
+                    "tokenizer": "cjk_bigram.v1",
+                    "vector_weight": 0.6,
+                    "bm25_weight": 0.4,
+                },
+            },
         ),
     }
     for name, module in modules.items():
