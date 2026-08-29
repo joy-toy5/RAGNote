@@ -72,6 +72,9 @@ def evaluation_run_id(
     )
 
 
+ANSWER_PATHS = ("retrieval_only", "generated")
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutorDescriptor:
     """执行器对本次索引和检索配置的显式声明。"""
@@ -79,11 +82,35 @@ class ExecutorDescriptor:
     executor_id: str
     index_version: str
     retrieval_config_sha256: str
+    answer_path: str = "retrieval_only"
+    """本次执行是否真的跑了生成层（RAG-008）。
+
+    离线 run 只到检索为止，`predicted_no_answer` 只能来自检索层门禁，所以
+    `false_answer_rate` 是「门禁单独的漏判率」，不是系统答错率。不标出来，
+    这个数会被读成后者。默认 retrieval_only：旧 run 的 JSON 里没有这个键，
+    反序列化时取默认值，与它们的实际执行方式一致。
+    """
 
     def __post_init__(self) -> None:
         _nonempty(self.executor_id, "executor_id")
         validate_index_version(self.index_version)
         validate_blob_id(self.retrieval_config_sha256)
+        if self.answer_path not in ANSWER_PATHS:
+            raise ValueError(f"answer_path 必须是 {ANSWER_PATHS} 之一")
+
+    def execution_identity_v1(self) -> dict[str, str]:
+        """`rag-note.eval-execution.v1` 摘要用的字段集，**冻结不再增补**。
+
+        `execution_sha256` 摘的就是这一份。v1 已经有三个冻结 run 依赖，往里加
+        字段会让它们全部加载失败（`__post_init__` 会重算校验），所以后加的
+        `answer_path` 显式落在 v1 之外 —— 契约串带版本号，v1 就该一直是 v1。
+        报告元数据走 `asdict`，仍然会带上新字段，可见性不受影响。
+        """
+        return {
+            "executor_id": self.executor_id,
+            "index_version": self.index_version,
+            "retrieval_config_sha256": self.retrieval_config_sha256,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,7 +283,7 @@ class EvaluationRun:
         expected_execution = sha256_json(
             {
                 "contract": "rag-note.eval-execution.v1",
-                "executor": asdict(self.executor),
+                "executor": self.executor.execution_identity_v1(),
                 "queries": [asdict(query) for query in self.queries],
             }
         )

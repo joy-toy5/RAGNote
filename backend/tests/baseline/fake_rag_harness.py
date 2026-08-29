@@ -260,12 +260,44 @@ class FakeRetriever:
         return _documents("knowledge_base", state.scenario.kb_documents)
 
 
+@dataclass(frozen=True)
+class FakeRouteRetrieval:
+    """`RouteRetrieval` 的鸭子类型替身，只提供生产实际读取的三个属性。"""
+
+    fused: tuple[Any, ...]
+    both_routes_present: bool
+    overlap_count: int | None
+
+
 class FakeVectorStore:
     async def get_dynamic_weights(self, _: str) -> tuple[float, float]:
         return (0.5, 0.5)
 
     async def get_retriever(self, _: str, __: str) -> FakeRetriever:
         return FakeRetriever()
+
+    async def retrieve_with_routes(
+        self,
+        search_query: str,
+        user_id: str,
+        *,
+        weight_query: str | None = None,
+    ) -> FakeRouteRetrieval:
+        """生产 retrieve_document 现在走这条路（RAG-008）。
+
+        两路交集刻意非 0：基线场景刻画的是「检索正常」下的调用放大与降级行为，
+        若让交集为 0，每个场景都会先被拒答门禁截断，基线就不再刻画它本来要
+        刻画的东西。真实 `RouteRetrieval.overlap_count` 的判定另由
+        tests/m3/test_route_visibility.py 覆盖 —— 本 harness 禁止 import
+        langchain_chroma，无法加载真实类。
+        """
+        del weight_query, user_id
+        documents = await FakeRetriever().ainvoke(search_query)
+        return FakeRouteRetrieval(
+            fused=tuple(documents),
+            both_routes_present=True,
+            overlap_count=len(documents),
+        )
 
 
 class FakeNoteStore:
@@ -447,26 +479,33 @@ def _timed_service_class(base: type) -> type:
             finally:
                 _state().record_timing("hyde", started)
 
-        async def retrieve_document(self, query: str) -> list[FakeDocument]:
+        async def retrieve_document(
+            self, query: str, **options: Any
+        ) -> list[FakeDocument]:
+            # 必须转发关键字参数：计时包装器要对生产签名透明。此前写死为
+            # (self, query)，生产加 routes_sink 出参后（RAG-008）会抛 TypeError，
+            # 被外层 except 吞成空文档，降级判定随之全部变成 unverified。
             started = time.perf_counter_ns()
             try:
-                return await super().retrieve_document(query)
+                return await super().retrieve_document(query, **options)
             finally:
                 _state().record_timing("retrieval_flow", started)
 
         async def reorder_documents(
-            self, query: str, documents: list[Any]
+            self, query: str, candidates: list[Any]
         ) -> list[Any]:
             started = time.perf_counter_ns()
             try:
-                return await super().reorder_documents(query, documents)
+                return await super().reorder_documents(query, candidates)
             finally:
                 _state().record_timing("rerank", started)
 
-        async def get_documents_and_summary(self, query: str) -> dict[str, Any]:
+        async def get_documents_and_summary(
+            self, query: str, **options: Any
+        ) -> dict[str, Any]:
             started = time.perf_counter_ns()
             try:
-                return await super().get_documents_and_summary(query)
+                return await super().get_documents_and_summary(query, **options)
             finally:
                 _state().record_timing("end_to_end", started)
 

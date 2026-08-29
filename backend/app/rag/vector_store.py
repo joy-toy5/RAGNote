@@ -160,6 +160,19 @@ class VectorStoreService:
     async def get_retriever(self, query: str | None, user_id: str):
         return await self.hybrid_retriever.get_retriever(query, user_id)
 
+    async def retrieve_with_routes(
+        self,
+        search_query: str,
+        user_id: str,
+        *,
+        weight_query: str | None = None,
+    ):
+        return await self.hybrid_retriever.retrieve_with_routes(
+            search_query,
+            user_id,
+            weight_query=weight_query,
+        )
+
     async def get_dynamic_weights(self, query: str = None):
         # 委托给实例：权重现在是 HybridRetriever 的实例状态（可被离线消融显式
         # 覆盖），不再是静态启发式。

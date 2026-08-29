@@ -1,4 +1,6 @@
 import asyncio
+from dataclasses import dataclass
+
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
@@ -7,6 +9,46 @@ from langchain_classic.retrievers import EnsembleRetriever
 
 from app.utils.config import chroma_config
 from .tokenization import cjk_bigram_tokenize
+
+
+def _fusion_key(document: Document) -> str:
+    """融合与交集必须用同一个身份键。
+
+    生产构造 `EnsembleRetriever` 时没有传 `id_key`，所以库里 RRF 的去重与累加
+    都按 `page_content`。交集若改用 chunk_id，「两路命中同一文档」的定义就和
+    融合折叠的定义不一致，交集数会和实际被累加的文档数对不上。
+    """
+    return document.page_content
+
+
+@dataclass(frozen=True, slots=True)
+class RouteRetrieval:
+    """一次混合检索的两路可见结果（RAG-002 / RAG-008）。
+
+    `EnsembleRetriever.invoke` 只返回融合后的列表，两路各自召回了什么被丢掉。
+    拒答需要知道「向量路和词法路是否指向同一批证据」，所以这里把两路结果与
+    融合结果一并带出，而不是记在检索器实例上 —— 每次查询都新建服务实例，
+    实例状态没有并发风险，但返回值让调用方无法读到上一次查询的残留。
+    """
+
+    fused: tuple[Document, ...]
+    vector_documents: tuple[Document, ...]
+    bm25_documents: tuple[Document, ...] = ()
+    weights: tuple[float, float] = (1.0, 0.0)
+    both_routes_present: bool = False
+
+    @property
+    def overlap_count(self) -> int | None:
+        """两路命中的同一文档数；单路兜底时返回 None 表示未定义。
+
+        未定义与 0 必须区分：单路时词法路根本没跑，不是「跑了但毫无交集」。
+        把它当 0 会让向量兜底路径上的每条查询都被拒答。
+        """
+        if not self.both_routes_present:
+            return None
+        vector_keys = {_fusion_key(document) for document in self.vector_documents}
+        bm25_keys = {_fusion_key(document) for document in self.bm25_documents}
+        return len(vector_keys & bm25_keys)
 
 
 class PositiveScoreBM25Retriever(BM25Retriever):
@@ -69,8 +111,14 @@ class HybridRetriever:
         RAG-005 的教训：`[vec=0.3, bm25=0.7]` 把 0.7 给了失效的那一路。修好分词
         后仍保持向量不低于 BM25，因为 RRF 是 weight/(rank+60)：向量权重 0.6 时
         rank 20 得 0.6/80=0.00750，BM25 权重 0.4 时 rank 1 得 0.4/61=0.00656，
-        向量 top-k 因此必然全部排在任何 BM25 独有候选之前，`Recall@k` 不会低于
-        纯向量。该性质要求权重比 > 80/61 ≈ 1.311。
+        向量 top-k 因此必然全部排在任何 BM25 独有候选之前。该性质要求权重比
+        > (k+60)/61，k=20 时约 1.311。
+
+        它保证的是集合而非次序：结论只有 `set(fused[:k]) == set(vector_top_k)`，
+        被两路同时命中的文档会累加得分、在向量 top-k *内部* 上移，把相关 chunk
+        挤到更浅的 cutoff 之外。因此「`Recall@cutoff` 不低于纯向量」只在
+        `cutoff >= per_route_k` 时是构造保证，浅层 cutoff 属实测（RAG-003）。
+        反例：per_route_k=10 / cutoff=5 时 hybrid 0.9375 < vector_only 0.9500。
         """
         if len(tuple(weights)) != 2:
             raise ValueError("融合权重必须是 [向量权重, BM25权重] 两项")
@@ -156,6 +204,67 @@ class HybridRetriever:
             return ensemble_retriever
         else:
             return vector_retriever
+
+    async def retrieve_with_routes(
+        self,
+        search_query: str,
+        user_id: str,
+        *,
+        weight_query: str | None = None,
+    ) -> RouteRetrieval:
+        """执行混合检索并保留两路各自的结果（RAG-008）。
+
+        与 `get_retriever(...).ainvoke(...)` 的差别只在可见性：融合仍然委托给
+        `EnsembleRetriever.weighted_reciprocal_rank`，权重、常数 c 与 id_key 都
+        取自同一个实例，因此融合次序与走 `invoke` 逐位相同（见
+        tests/m3/test_route_visibility.py 的等价性测试）。
+
+        :param search_query: 实际用于检索的文本。HyDE 开启时是假设性文档。
+        :param weight_query: 用于决定融合权重的文本，默认与 search_query 相同。
+                  生产用原始查询判定权重、用假设性文档检索，两者不是同一个串。
+        """
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("构造检索器必须提供有效的用户 ID")
+
+        filter_dict = {'user_id': user_id}
+        vector_retriever = self.vectors_store.as_retriever(
+            search_type='similarity',
+            search_kwargs={'k': self.k, 'filter': filter_dict},
+        )
+        bm25_retriever = await self.get_bm25_retriever(user_id)
+        weights = await self.get_dynamic_weights(
+            weight_query if weight_query is not None else search_query
+        )
+
+        if not (bm25_retriever and weights[1] > 0):
+            # 单路兜底：与 get_retriever 同一个判断条件。此时交集未定义。
+            documents = await vector_retriever.ainvoke(search_query)
+            return RouteRetrieval(
+                fused=tuple(documents),
+                vector_documents=tuple(documents),
+                weights=tuple(weights),
+                both_routes_present=False,
+            )
+
+        ensemble_retriever = EnsembleRetriever(
+            retrievers=[vector_retriever, bm25_retriever],
+            weights=weights,
+        )
+        # 与库内 arank_fusion 一致地并行两路，避免把混合检索退化成串行。
+        vector_documents, bm25_documents = await asyncio.gather(
+            vector_retriever.ainvoke(search_query),
+            bm25_retriever.ainvoke(search_query),
+        )
+        fused = ensemble_retriever.weighted_reciprocal_rank(
+            [list(vector_documents), list(bm25_documents)]
+        )
+        return RouteRetrieval(
+            fused=tuple(fused),
+            vector_documents=tuple(vector_documents),
+            bm25_documents=tuple(bm25_documents),
+            weights=tuple(weights),
+            both_routes_present=True,
+        )
 
     async def get_dynamic_weights(self, query: str = None):
         """

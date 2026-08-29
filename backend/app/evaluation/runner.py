@@ -96,7 +96,7 @@ async def run_dataset(
     execution_sha256 = sha256_json(
         {
             "contract": "rag-note.eval-execution.v1",
-            "executor": asdict(descriptor),
+            "executor": descriptor.execution_identity_v1(),
             "queries": [asdict(query) for query in queries],
         }
     )

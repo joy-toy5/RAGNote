@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -134,9 +135,21 @@ class _RetrievalOnlyRagService:
 
     async def get_retrieval_trace(self, query: str, *, query_id: str) -> RetrievalTrace:
         try:
-            return await self._service.get_retrieval_trace(query, query_id=query_id)
+            trace = await self._service.get_retrieval_trace(query, query_id=query_id)
         finally:
             self.close()
+        if trace.candidates or trace.index_version is not None:
+            return trace
+        # 零候选拒答：index_version 来自候选元数据，没有候选就无从得知，生产
+        # RagService 因此把它留成 None —— 它不该断言自己没观测到的版本。
+        # 但 execution_from_trace 要求空候选 trace 也携带 index identity，否则
+        # 一次拒答会以 ValueError 终止整条 run（_execute_query 对 ValueError
+        # 原样上抛），拒答根本不会被计分。
+        #
+        # 由这里补齐是契约要求的形态：本工厂的 index_version 来自 manifest，而
+        # manifest 已在开跑前与 dataset 比对、且与索引目录是同一次构建的产物，
+        # 所以它是「由具体工厂验证的身份」，不是 request 的自报值。
+        return replace(trace, index_version=self._descriptor.index_version)
 
     def close(self) -> None:
         """每次构造 Chroma 都让 SharedSystemClient refcount +2，只有 close 会减。"""
@@ -161,6 +174,8 @@ class OfflineRagServiceFactory:
             executor_id=f"{EXECUTOR_ID}.{mode}",
             index_version=index_version,
             retrieval_config_sha256=sha256_json(retrieval_config),
+            # 这条路只到检索为止：没有 LLM 调用，生成层拒答不可能被观测到。
+            answer_path="retrieval_only",
         )
         self._index_dir = index_dir
         self._top_k = retrieval_config["top_k"]

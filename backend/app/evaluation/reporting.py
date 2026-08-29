@@ -156,6 +156,7 @@ def render_report_markdown(report: EvaluationReport) -> str:
         f"- source_fingerprint: {_md_literal(metadata['source_fingerprint'])}",
         f"- quality_fingerprint: {_md_literal(report.quality_fingerprint)}",
         f"- hard_gate: {_md_literal(report.hard_gate['status'])}",
+        f"- no_answer_scope: {_md_literal(aggregate['no_answer_scope'])}",
         "",
         "## 聚合指标",
         "",
@@ -174,9 +175,19 @@ def render_report_markdown(report: EvaluationReport) -> str:
         "no_answer_recall",
         "no_answer_f1",
         "false_answer_rate",
+        "refusal_rate_answerable",
+        "refusal_rate_unanswerable",
         "cross_user_hit_count",
     ):
         lines.append(f"| `{key}` | {aggregate[key]} |")
+    if aggregate["no_answer_scope"] == "retrieval_only":
+        lines.extend(
+            [
+                "",
+                "> 本次 run 未执行生成层。上表 `no_answer_*` / `false_answer_rate` /",
+                "> `refusal_rate_*` 只反映检索层拒答门禁，不是系统答错率。",
+            ]
+        )
     lines.extend(["", "## 失败诊断", ""])
     if not report.failures:
         lines.append("无。")
@@ -356,12 +367,39 @@ def _aggregate(
             "no_answer_f1": _rounded(no_answer.f1),
             "false_answer_rate": _rounded(no_answer.false_answer_rate),
             "no_answer_run_error_count": no_answer.run_error_count,
+            # 作用域必须跟着数走：retrieval_only 下上面这组只反映检索层门禁，
+            # 生成层拒答一次都没执行，把 false_answer_rate 当系统答错率是错读。
+            "no_answer_scope": run.executor.answer_path,
             "cross_user_hit_count": cross_user_hit_count,
             "stage_latency_ms": _stage_latency(run),
             "usage_totals": _usage_totals(run),
         }
     )
+    aggregate.update(_refusal_rates(no_answer_outcomes))
     return aggregate
+
+
+def _refusal_rates(
+    outcomes: list[tuple[bool, bool, bool]],
+) -> dict[str, Any]:
+    """按可回答性分开数拒答，因为收益与代价落在不同的组里。
+
+    合成一个 false_answer_rate 会把「该拒没拒」和「不该拒却拒了」压成一个数，
+    看不出调门禁是换来了收益还是只是在误伤。分组后两个率都能单独盯漂移。
+    """
+    groups = {"answerable": [0, 0], "unanswerable": [0, 0]}
+    for actual_no_answer, predicted_no_answer, _ in outcomes:
+        key = "unanswerable" if actual_no_answer else "answerable"
+        groups[key][0] += int(predicted_no_answer)
+        groups[key][1] += 1
+    payload: dict[str, Any] = {}
+    for key, (refused, total) in groups.items():
+        payload[f"refusal_count_{key}"] = refused
+        payload[f"refusal_rate_{key}"] = (
+            None if total == 0 else _rounded(refused / total)
+        )
+        payload[f"query_count_{key}"] = total
+    return payload
 
 
 def _stage_latency(run: EvaluationRun) -> dict[str, dict[str, float | int]]:
