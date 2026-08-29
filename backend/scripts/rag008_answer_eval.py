@@ -11,11 +11,10 @@ LLM 观测。
 隔离设计：**只把生成层变成真的**。HyDE 仍替换为 identity、reranker 仍跳过，
 检索侧与冻结 hybrid run 逐位同构，因此指标变化只能归因于生成层。
 
-两个必须写在结果里的可复现性缺口：
-1. `source_fingerprint` 的 glob（`app/**/*.py`、`scripts/m3_*.py`、
-   `app/config/*.yaml`）**不覆盖 `app/prompt/*.txt`**，而拒答行为完全由
-   `rag_summarize.txt` 驱动。这里单独记 `prompt_sha256` 作为补偿，但它是绕过
-   不是修好 —— glob 本身没动。
+可复现性状态：
+1. （RAG-017 已修）`source_fingerprint` 的 glob 现在包含 `app/prompt/*.txt`，
+   改 `rag_summarize.txt` 会改指纹。本脚本仍单独记 `prompt_sha256`：它刻意不叫
+   `m3_*`，不进那套 glob，自带记录才能把结果绑到当时的 prompt 上。
 2. `ChatTongyi` 只有 `top_p=0.7`，没有 temperature=0，**生成不确定**。20 条样本
    上 false_answer_rate 的分辨率是 0.1，重跑会抖。用 `--repeat 2` 报多次结果，
    不要拿单次当定论。
@@ -292,7 +291,10 @@ async def run(arguments: argparse.Namespace) -> int:
                 "script_sha256": script_sha256,
                 "prompt_sha256": prompt_sha256,
                 "prompt_file": str(PROMPT_FILE.relative_to(BACKEND)),
-                "prompt_in_source_fingerprint": False,
+                # RAG-017 之后 `app/prompt/*.txt` 已进入 m3_run_eval 的
+                # FINGERPRINT_PATTERNS，改 prompt 会改指纹。这里仍单独记
+                # prompt_sha256：本脚本刻意不叫 m3_*，不参与那套指纹计算。
+                "prompt_in_source_fingerprint": True,
                 "answer_path": "generated",
                 "llm_type": os.getenv("LLM_TYPE", "ALIYUN"),
                 "model": model_name,

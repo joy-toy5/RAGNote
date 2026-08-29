@@ -272,10 +272,23 @@ def build_retrieval_config(
     }
 
 
+# 影响行为的源不止 .py 与 .yaml：`app/prompt/*.txt` 里的 prompt 直接决定拒答与
+# 摘要行为（`rag_summarize.txt` 第 5 条即是拒答开关）。RAG-017 之前该目录不在
+# 采集范围内，改 prompt 可以把 `false_answer_rate` 从 0.000 推到 1.000 而指纹
+# 逐字节不变。加入后既有冻结 run 的 `source_fingerprint` 一次性失效，新旧值对照
+# 已登记在台账。
+FINGERPRINT_PATTERNS = (
+    "app/**/*.py",
+    "scripts/m3_*.py",
+    "app/config/*.yaml",
+    "app/prompt/*.txt",
+)
+
+
 def source_fingerprint(root: Path) -> str:
-    """对影响检索行为的源码取稳定摘要，脏工作树也能被绑定。"""
+    """对影响检索与生成行为的源取稳定摘要，脏工作树也能被绑定。"""
     targets: list[Path] = []
-    for pattern in ("app/**/*.py", "scripts/m3_*.py", "app/config/*.yaml"):
+    for pattern in FINGERPRINT_PATTERNS:
         targets.extend(
             path
             for path in root.glob(pattern)
