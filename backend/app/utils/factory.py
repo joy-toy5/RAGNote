@@ -5,15 +5,53 @@ from typing import Optional, List
 import os
 from dotenv import load_dotenv
 
-from langchain_community.chat_models.tongyi import ChatTongyi
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_ollama import OllamaEmbeddings, ChatOllama
+from langchain_openai import ChatOpenAI
 
 from app.core.logger_handler import logger
 
 # 加载环境变量
 load_dotenv()
+
+# 阿里云百炼的 OpenAI 兼容端点。`ALIYUN_BASE_URL` 未设置时兜到这里，绝不能让
+# ChatOpenAI 用它自己的默认值——那会打 api.openai.com，是比原缺陷更隐蔽的错误。
+ALIYUN_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
+def build_aliyun_chat_model(
+    *,
+    model_name: str,
+    streaming: bool,
+    top_p: float = 0.7,
+) -> ChatOpenAI:
+    """构造阿里云百炼对话客户端（`RAG-019`）。
+
+    为什么不用 `ChatTongyi`：`langchain-community` 0.4.1 的 `ChatTongyi` 没有
+    `base_url` 字段（不在 `model_fields` 内）且 `model_config` 为 `extra='ignore'`，
+    传给它的 `base_url` 被静默接受再丢弃——无警告、无异常、`model_kwargs` 仍为空。
+    生产因此永远打原生 DashScope 端点，而 `.env` 配的 `qwen3.8-max` 只在兼容模式
+    端点存在（原生端点返回 400 `InvalidParameter: url error, please check url`，
+    报错指向 URL 而非模型，排查成本极高）。同时 `ALIYUN_BASE_URL` 这个配置项在整条
+    生产链路上无效，任何靠它切换端点（兼容模式、私有网关、代理）的运维手段都会静默失效。
+
+    端点事实由 `scripts/rag019_endpoint_probe.py` 实测确认，含一个负对照：
+    兼容模式端点对不存在的模型名返回 404 `model_not_found`，因此"兼容模式 200"
+    可以作为模型存在的证据。
+
+    三处调用点（ChatModel / VisionModel / Agent）走同一个构造函数，避免其中一处
+    被改回去而另两处留在旧行为上。
+    """
+    api_key = os.getenv("ALIYUN_ACCESS_KEY_SECRET")
+    base_url = os.getenv("ALIYUN_BASE_URL") or ALIYUN_COMPATIBLE_BASE_URL
+    return ChatOpenAI(
+        model=model_name,
+        api_key=api_key,
+        base_url=base_url,
+        streaming=streaming,
+        top_p=top_p,
+    )
 
 
 class EmbeddingServiceError(RuntimeError):
@@ -188,18 +226,10 @@ class ChatModelFactory(BaseModelFactory):
         
         elif llm_type == "ALIYUN":
             model_name = os.getenv("ALIYUN_MODEL_NAME", os.getenv("CHAT_MODEL_NAME", "qwen3-max"))
-            api_key = os.getenv("ALIYUN_ACCESS_KEY_SECRET")
-            base_url = os.getenv("ALIYUN_BASE_URL")
-            
+
             logger.info(f"📦 ChatModel 使用阿里云百炼模型: {model_name}")
-            
-            return ChatTongyi(
-                model=model_name,
-                api_key=api_key,
-                base_url=base_url,
-                streaming=True,
-                top_p=0.7,
-            )
+
+            return build_aliyun_chat_model(model_name=model_name, streaming=True)
         
         else:
             raise ValueError(f"不支持的LLM_TYPE: {llm_type}，可选值: ALIYUN, OLLAMA")
@@ -277,18 +307,13 @@ class VisionModelFactory(BaseModelFactory):
 
         elif vision_type == "ALIYUN":
             model_name = os.getenv("VISION_CHAT_MODEL_NAME") or os.getenv("CHAT_MODEL_NAME") or "qwen3-max"
-            api_key = os.getenv("ALIYUN_ACCESS_KEY_SECRET")
-            base_url = os.getenv("ALIYUN_BASE_URL")
 
             logger.info(f"🎨 VisionModel 使用阿里云百炼多模态模型: {model_name}")
 
-            return ChatTongyi(
-                model=model_name,
-                api_key=api_key,
-                base_url=base_url,
-                streaming=False,
-                top_p=0.7,
-            )
+            # streaming=False 的理由见类文档：图片理解要在完整上下文上推理。
+            # `vision_service.py` 送的是 OpenAI 形状的 image_url content block，
+            # 与兼容模式端点天然一致。
+            return build_aliyun_chat_model(model_name=model_name, streaming=False)
 
         else:
             raise ValueError(f"不支持的VISION_MODEL_TYPE: {vision_type}，可选值: ALIYUN, OLLAMA")

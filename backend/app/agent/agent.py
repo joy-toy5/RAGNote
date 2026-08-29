@@ -5,7 +5,6 @@ from langsmith import traceable
 from typing import List, Optional, AsyncGenerator
 
 from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
-from langchain_community.chat_models import ChatTongyi
 from langchain_ollama import ChatOllama
 from langchain_core.messages import BaseMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -17,6 +16,7 @@ from app.agent.agent_tools import rag_summary_tools, what_time_is_now, get_user_
     create_note_tool, get_related_notes_tool, bind_tool_context, ToolContext
 from app.core.logger_handler import logger
 from app.services import session_manager as sm
+from app.utils.factory import build_aliyun_chat_model
 from app.utils.prompt_loader import load_prompt
 
 
@@ -92,19 +92,13 @@ class AgentFactory:
             )
         
         elif llm_type == "ALIYUN":
-            api_key = os.getenv("ALIYUN_ACCESS_KEY_SECRET")
-            base_url = os.getenv("ALIYUN_BASE_URL")
             model_name = custom_model or os.getenv("ALIYUN_MODEL_NAME", self.model)
             
             logger.info(f"🤖 Agent使用阿里云百炼模型: {model_name}")
             
-            return ChatTongyi(
-                model=model_name,
-                api_key=api_key,
-                base_url=base_url,
-                streaming=True,
-                top_p=0.7,
-            )
+            # 与 ChatModelFactory / VisionModelFactory 共用构造函数（`RAG-019`）：
+            # ChatTongyi 会静默丢弃 base_url，三处必须一起改，否则改一处留两处。
+            return build_aliyun_chat_model(model_name=model_name, streaming=True)
         
         else:
             raise ValueError(f"不支持的LLM_TYPE: {llm_type}，可选值: ALIYUN, OLLAMA")

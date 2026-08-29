@@ -47,14 +47,10 @@ async def main() -> None:
 
     chat_model = None
     if args.model:
-        from langchain_community.chat_models.tongyi import ChatTongyi
+        # 与生产、与 rag008_answer_eval 同一构造函数（`RAG-019`）。
+        from app.utils.factory import build_aliyun_chat_model
 
-        chat_model = ChatTongyi(
-            model=args.model,
-            api_key=os.getenv("ALIYUN_ACCESS_KEY_SECRET"),
-            streaming=True,
-            top_p=0.7,
-        )
+        chat_model = build_aliyun_chat_model(model_name=args.model, streaming=True)
 
     store = VectorStoreService.for_explicit_target(
         persist_directory=str(Path(args.index_dir).resolve()),

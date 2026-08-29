@@ -15,7 +15,7 @@ LLM 观测。
 1. （RAG-017 已修）`source_fingerprint` 的 glob 现在包含 `app/prompt/*.txt`，
    改 `rag_summarize.txt` 会改指纹。本脚本仍单独记 `prompt_sha256`：它刻意不叫
    `m3_*`，不进那套 glob，自带记录才能把结果绑到当时的 prompt 上。
-2. `ChatTongyi` 只有 `top_p=0.7`，没有 temperature=0，**生成不确定**。20 条样本
+2. 客户端只传 `top_p=0.7`，没有 temperature=0，**生成不确定**。20 条样本
    上 false_answer_rate 的分辨率是 0.1，重跑会抖。用 `--repeat 2` 报多次结果，
    不要拿单次当定论。
 
@@ -235,16 +235,13 @@ async def run(arguments: argparse.Namespace) -> int:
     chat_model = None
     if arguments.model:
         # 不改 .env：只在本次评测里换模型，并把实际用的名字记进产物。
-        from langchain_community.chat_models.tongyi import ChatTongyi
+        # 走生产同一个构造函数（`RAG-019`）：此前这里自建 ChatTongyi 且不传 base_url，
+        # 于是评测只能用原生端点上存在的模型，`.env` 里配的 qwen3.8-max 测不到。
+        from app.utils.factory import build_aliyun_chat_model
 
-        chat_model = ChatTongyi(
-            model=arguments.model,
-            api_key=os.getenv("ALIYUN_ACCESS_KEY_SECRET"),
-            streaming=True,
-            top_p=0.7,
-        )
+        chat_model = build_aliyun_chat_model(model_name=arguments.model, streaming=True)
     print(f"script_sha256 : {script_sha256}")
-    print(f"prompt_sha256 : {prompt_sha256}  ({PROMPT_FILE.name}，不在 source_fingerprint 内)")
+    print(f"prompt_sha256 : {prompt_sha256}  ({PROMPT_FILE.name}，已在 source_fingerprint 内)")
     print(f"model         : {os.getenv('LLM_TYPE', 'ALIYUN')} / {model_name}")
     print(f"index_version : {dataset.index_version}")
     print(f"queries       : {len(selected)}（不可回答 "
@@ -281,7 +278,7 @@ async def run(arguments: argparse.Namespace) -> int:
     rates = [item["metrics"]["false_answer_rate"] for item in passes]
     print("\n=== 汇总 ===")
     print(f"false_answer_rate 各轮：{rates}")
-    print("生成不确定（ChatTongyi 无 temperature=0，仅 top_p=0.7），"
+    print("生成不确定（无 temperature=0，仅 top_p=0.7），"
           "以上为多轮观测值，不是单一定论。")
 
     output.write_text(
