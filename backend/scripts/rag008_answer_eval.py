@@ -181,15 +181,23 @@ async def answer_one(
     index_dir: str,
     vector_store_factory: Any,
     chat_model: Any = None,
+    max_documents: int | None = None,
 ) -> dict[str, Any]:
     """跑完整答案路：真 LLM 生成，HyDE/reranker 仍替换掉。"""
-    from app.rag.rag_service import INFRASTRUCTURE_FAILURE_MESSAGES, RagService
+    from app.rag.rag_service import (
+        DEFAULT_MAX_CONTEXT_DOCUMENTS,
+        INFRASTRUCTURE_FAILURE_MESSAGES,
+        RagService,
+    )
 
     store = vector_store_factory()
     service = RagService(
         user_id=query.user_id,
         vector_store=store,
         note_service_override=_EmptyNoteService(),
+        max_documents=(
+            DEFAULT_MAX_CONTEXT_DOCUMENTS if max_documents is None else max_documents
+        ),
     )
     if chat_model is not None:
         # 覆盖模型必须连带重建 chain：chain 在 __init__ 里已经绑定了原 chat_model，
@@ -222,6 +230,14 @@ async def answer_one(
     # 不在这里认出来，一次 LLM 故障就会被记成「该拒却答了」，与真幻觉不可分辨。
     if error is None and result.get("summary") in INFRASTRUCTURE_FAILURE_MESSAGES:
         error = f"INFRASTRUCTURE_FAILURE:{result['summary']}"
+
+    # RAG-023：qwen3.8-max 会偶发返回空 content 且 finish_reason == "stop"。
+    # 不抛异常、`no_answer` 也是 False，所以既不被上面那条捕获，也与「该拒却答了」
+    # 不可分辨。单独计一类而不是重试 —— 发生率还没测出来，重试会把它藏掉。
+    if error is None:
+        summary = result.get("summary")
+        if summary is not None and not str(summary).strip():
+            error = "EMPTY_CONTENT"
 
     trace = result.get("retrieval_trace") or {}
     return {
@@ -273,6 +289,11 @@ def score(rows: list[dict[str, Any]]) -> dict[str, Any]:
         # 代价指标：能回答却被拒的比例。收益不能只看上一行。
         "refusal_rate_answerable": _rate(fp, fp + tn),
         "gate_fired_count": sum(1 for row in rows if row["retrieval_gate_fired"]),
+        # RAG-023：空 content 单独计数。它已被算进 run_error_count，这里再拆一层，
+        # 否则「错误 2 条」看不出是超时、基础设施兜底还是空返回。
+        "empty_content_count": sum(
+            1 for row in rows if row["error"] == "EMPTY_CONTENT"
+        ),
     }
 
 
@@ -301,6 +322,14 @@ async def run(arguments: argparse.Namespace) -> int:
             top_k=TOP_K,
         )
 
+    from app.rag.rag_service import DEFAULT_MAX_CONTEXT_DOCUMENTS
+
+    effective_max_documents = (
+        DEFAULT_MAX_CONTEXT_DOCUMENTS
+        if arguments.max_documents is None
+        else arguments.max_documents
+    )
+
     prompt_sha256 = hashlib.sha256(PROMPT_FILE.read_bytes()).hexdigest()
     script_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     env_model = os.getenv("CHAT_MODEL_NAME") or os.getenv("ALIYUN_MODEL_NAME")
@@ -317,6 +346,9 @@ async def run(arguments: argparse.Namespace) -> int:
     print(f"prompt_sha256 : {prompt_sha256}  ({PROMPT_FILE.name}，已在 source_fingerprint 内)")
     print(f"model         : {os.getenv('LLM_TYPE', 'ALIYUN')} / {model_name}")
     print(f"index_version : {dataset.index_version}")
+    print(f"max_documents : {effective_max_documents}"
+          + ("（显式指定，RAG-018 曲线）" if arguments.max_documents is not None
+             else "（默认值）"))
     print(f"queries       : {len(selected)}（不可回答 "
           f"{sum(q.answerability == 'unanswerable' for q in selected)}）")
     print("可回答配额    : "
@@ -333,6 +365,7 @@ async def run(arguments: argparse.Namespace) -> int:
                 index_dir=str(index_dir),
                 vector_store_factory=_factory,
                 chat_model=chat_model,
+                max_documents=arguments.max_documents,
             )
             rows.append(row)
             mark = "拒答" if row["predicted_no_answer"] else "作答"
@@ -348,14 +381,17 @@ async def run(arguments: argparse.Namespace) -> int:
         print(
             f"  → false_answer_rate={metrics['false_answer_rate']} "
             f"refusal_rate_answerable={metrics['refusal_rate_answerable']} "
-            f"errors={metrics['run_error_count']}"
+            f"errors={metrics['run_error_count']} "
+            f"empty_content={metrics['empty_content_count']}"
         )
 
     rates = [item["metrics"]["false_answer_rate"] for item in passes]
     print("\n=== 汇总 ===")
     print(f"false_answer_rate 各轮：{rates}")
-    print("生成不确定（无 temperature=0，仅 top_p=0.7），"
-          "以上为多轮观测值，不是单一定论。")
+    # RAG-022 实测：temperature=0 / seed / 关闭思考三条路径都不产生确定性输出，
+    # 所以「不可复现」不是「没设 temperature」造成的，改口径以免误导读数的人。
+    print("生成不确定（RAG-022 实测：设 temperature=0 或 seed 均无效，"
+          "服务端在给定采样参数下仍不确定），以上为多轮观测值，不是单一定论。")
 
     output.write_text(
         json.dumps(
@@ -377,6 +413,10 @@ async def run(arguments: argparse.Namespace) -> int:
                 "deterministic": False,
                 "index_version": dataset.index_version,
                 "top_k": TOP_K,
+                # RAG-018：进上下文的文档数必须进产物，否则曲线上的点无法归属深度。
+                # 它同时决定 trace 里 selected_for_context 的标记深度。
+                "max_documents": effective_max_documents,
+                "max_documents_overridden": arguments.max_documents is not None,
                 # RAG-021：抽样构成必须进产物。此前只按 user 分层，跨块/跨文档
                 # 整型缺失且产物里看不出来，读数的人无从判断结论的适用范围。
                 "sampling": "stratified_by_query_type_then_user",
@@ -408,6 +448,13 @@ def main() -> int:
     parser.add_argument(
         "--model",
         help="覆盖 CHAT_MODEL_NAME，只作用于本次评测，不写回 .env",
+    )
+    parser.add_argument(
+        "--max-documents",
+        type=int,
+        default=None,
+        help="进上下文的文档数（RAG-018 曲线）。不传走生产默认值 3；"
+             "同时决定 trace 里 selected_for_context 的标记深度",
     )
     return asyncio.run(run(parser.parse_args()))
 

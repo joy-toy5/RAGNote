@@ -32,6 +32,14 @@ INFRASTRUCTURE_FAILURE_MESSAGES = (
     GENERATION_TIMEOUT_MESSAGE,
     GENERATION_ERROR_MESSAGE,
 )
+# 进入生成上下文的文档数上限（RAG-018）。原为 `get_documents_and_summary` 里的行内
+# 魔数 3，提为常量+构造参数只是为了让评测能扫 {3,5,8} 曲线；**默认值仍是 3，生产
+# 行为逐位不变**，故不产生可比性断点。
+#
+# 它同时决定两处，必须一起走：一是送进摘要的文档数，二是 trace 里哪些候选被标
+# `selected_for_context`。只改前者会让 trace 谎报实际进上下文的条数，而 R@3 这类
+# 生产决定性指标正是按这个标记算的。
+DEFAULT_MAX_CONTEXT_DOCUMENTS = 3
 
 
 class RagService:
@@ -42,6 +50,7 @@ class RagService:
         *,
         vector_store=None,
         note_service_override=None,
+        max_documents: int = DEFAULT_MAX_CONTEXT_DOCUMENTS,
     ):
         """
         :param vector_store: 显式注入的向量库服务；为 None 时使用生产单例。
@@ -50,7 +59,15 @@ class RagService:
         :param note_service_override: 显式注入的笔记服务；为 None 时使用生产单例。
                              离线评测必须注入空实现：笔记候选没有 provenance 元数据，
                              会让 execution_from_trace 拒绝整条 Query。
+        :param max_documents: 进入生成上下文的文档数上限，默认 3（`RAG-018`）。
+                             生产不传，走默认值；只有扫曲线的评测才显式指定。
+                             同时决定 trace 里 `selected_for_context` 的标记深度。
         """
+        if not isinstance(max_documents, int) or isinstance(max_documents, bool):
+            raise TypeError(f"max_documents 必须是 int，收到 {type(max_documents).__name__}")
+        if max_documents < 1:
+            raise ValueError(f"max_documents 必须 >= 1，收到 {max_documents}")
+        self.max_documents = max_documents
         self.vector_store = (
             vector_store if vector_store is not None else VectorStoreService()
         )
@@ -403,8 +420,10 @@ class RagService:
                 no_answer=True,
             )
 
+        # 深度与下面送进摘要的 `self.max_documents` 必须一致，否则 trace 会谎报
+        # 实际进上下文的条数（`RAG-018`）。
         selected_candidates = [
-            candidate.select_for_context() if rank <= 3 else candidate
+            candidate.select_for_context() if rank <= self.max_documents else candidate
             for rank, candidate in enumerate(reordered_candidates, 1)
         ]
         return RetrievalTrace(
@@ -517,8 +536,8 @@ class RagService:
             try:
                 # 对每个文档单独总结（使用线程池并发处理）
                 individual_summaries = []
-                max_documents = 3  # 使用前3个最相关的文档
-                
+                max_documents = self.max_documents  # 默认 3，见 DEFAULT_MAX_CONTEXT_DOCUMENTS
+
                 if self.thinking_callback:
                     await self.thinking_callback({
                         "type": "thinking",

@@ -98,14 +98,53 @@ def test_production_context_depth_makes_recall_at_3_decisive() -> None:
 
     这条是源码契约测试：`max_documents` 一旦改动，k 的取舍依据就变了，门禁必须
     失败以强制重测，而不是让文档继续引用一个过期的结论。
+
+    从 `RAG-018` 起该深度是构造参数而非行内魔数，所以断言的是**默认值**而不是源码
+    字面量：改默认值仍然会让这条失败（强制重测），但评测显式传 `max_documents=8`
+    去扫曲线不会误伤它 —— 后者是本来就要做的事，前者才是需要门禁的漂移。
+    """
+    from app.rag.rag_service import DEFAULT_MAX_CONTEXT_DOCUMENTS
+
+    assert DEFAULT_MAX_CONTEXT_DOCUMENTS == PRODUCTION_CONTEXT_DEPTH
+    if PROBE_PATH.exists():
+        assert _probe()["production_context_depth"] == PRODUCTION_CONTEXT_DEPTH
+
+
+def test_context_depth_governs_both_summary_and_trace_marking() -> None:
+    """送进摘要的条数与 trace 里 `selected_for_context` 的深度必须同源。
+
+    这两处原本是两个各自写死的 3。只改一处会让 trace 谎报实际进上下文的条数，而
+    `R@3` 这类生产决定性指标正是按该标记算的 —— 曲线扫到 8 时若标记仍停在 3，
+    测出来的正确率会被归到错误的深度上。
     """
     source = (BACKEND_ROOT / "app" / "rag" / "rag_service.py").read_text(
         encoding="utf-8"
     )
-    assert f"max_documents = {PRODUCTION_CONTEXT_DEPTH}" in source
-    assert f"rank <= {PRODUCTION_CONTEXT_DEPTH}" in source
-    if PROBE_PATH.exists():
-        assert _probe()["production_context_depth"] == PRODUCTION_CONTEXT_DEPTH
+    assert "rank <= self.max_documents" in source, (
+        "trace 标记深度必须跟随 self.max_documents，不得写死字面量"
+    )
+    assert "max_documents = self.max_documents" in source, (
+        "摘要窗口必须跟随 self.max_documents，不得写死字面量"
+    )
+    # 两处都不允许退回字面量深度
+    assert f"rank <= {PRODUCTION_CONTEXT_DEPTH}" not in source
+    assert f"max_documents = {PRODUCTION_CONTEXT_DEPTH}" not in source
+
+
+def test_max_documents_rejects_invalid_values() -> None:
+    """深度是评测要扫的参数，非法值必须当场炸而不是静默降级。
+
+    静默降级会让曲线上出现一个「看起来跑了但其实用的是别的深度」的点，那比报错难
+    发现得多 —— 这正是 `RAG-019` 那个静默丢弃 `base_url` 的形态。
+    """
+    from app.rag.rag_service import RagService
+
+    for bad in (0, -1):
+        with pytest.raises(ValueError):
+            RagService(user_id="u", max_documents=bad)
+    for bad in (3.0, "3", True, None):
+        with pytest.raises(TypeError):
+            RagService(user_id="u", max_documents=bad)
 
 
 @requires_probe
