@@ -18,6 +18,9 @@ LLM 观测。
 2. 客户端只传 `top_p=0.7`，没有 temperature=0，**生成不确定**。20 条样本
    上 false_answer_rate 的分辨率是 0.1，重跑会抖。用 `--repeat 2` 报多次结果，
    不要拿单次当定论。
+3. 抽样自 `RAG-021` 起按 (query_type, user_id) 两级分层，配额表与选中的
+   query_id 都写进产物。**此前只按 user 分层的产物与本次不可比**：那批抽到的
+   10 条可回答全是单文档，跨块/跨文档整型缺失。
 
 刻意不叫 `m3_*`：同 `source_fingerprint` 理由，只读评测工具不该改变每个未来 run
 的指纹。
@@ -70,36 +73,106 @@ class _EmptyNoteService:
         self.notes_store = _EmptyNotesStore()
 
 
-def select_queries(dataset: Any) -> list[Any]:
-    """10 条不可回答全取 + 10 条可回答按 user 分层定额抽。
+def allocate_by_type(type_sizes: dict[str, int], total: int) -> dict[str, int]:
+    """按 query_type 分配名额：每型保底 1 条，余额按型内剩余量走最大余数法。
 
-    不用随机抽样：按 (user_id, query_id) 排序后轮转取，同一个数据集永远得到同一
-    批查询，重跑之间的差异因此只来自 LLM，不来自样本。
+    每型保底的理由：分层抽样的意义是每个 stratum 都有观测。纯比例分配会把小型
+    压到 0 条（`paraphrase` 只有 2/40），而整型缺失正是 `RAG-021` 的成因。保底
+    不是为了凑某条验收标准 —— 它是分层抽样的常规做法，且分配规则写死在这里，
+    任何人都能用型大小复算出同一张配额表。
+
+    tie-break 用型名升序，不用随机：同一数据集必须永远得到同一张表。
+    """
+    types = sorted(type_sizes)
+    if total < len(types):
+        raise ValueError(
+            f"名额 {total} 少于 query_type 数 {len(types)}，无法每型保底 1 条"
+        )
+    quota = {name: 1 for name in types}
+    remaining = total - len(types)
+    pool = sum(type_sizes.values()) - len(types)
+    if remaining > 0 and pool > 0:
+        shares = {name: (type_sizes[name] - 1) * remaining / pool for name in types}
+        for name in types:
+            take = min(int(shares[name]), type_sizes[name] - quota[name])
+            quota[name] += take
+            remaining -= take
+        order = sorted(types, key=lambda name: (-(shares[name] % 1), name))
+        while remaining > 0:
+            progressed = False
+            for name in order:
+                if remaining > 0 and quota[name] < type_sizes[name]:
+                    quota[name] += 1
+                    remaining -= 1
+                    progressed = True
+            if not progressed:
+                break
+    return quota
+
+
+def _rotate_by_user(queries: list[Any], quota: int, offset: int = 0) -> list[Any]:
+    """型内按 user 轮转取，避免某型的名额全落到同一个 user 上。
+
+    `offset` 让每个型错开起点。否则每型配额只有 1~2 时，轮转永远只取到 user_a
+    与 user_b，排在后面的 user 整个抽不到（第一版分层抽样就掉进了这个坑：型覆盖
+    修好了，10 条却全落在 user_a/user_b）。取模而非随机，同样是为了可复算。
+    """
+    by_user: dict[str, list[Any]] = {}
+    for query in sorted(queries, key=lambda q: (q.user_id, q.query_id)):
+        by_user.setdefault(query.user_id, []).append(query)
+    user_ids = sorted(by_user)
+    start = offset % len(user_ids) if user_ids else 0
+    rotated = user_ids[start:] + user_ids[:start]
+    picked: list[Any] = []
+    index = 0
+    while len(picked) < quota:
+        progressed = False
+        for user_id in rotated:
+            bucket = by_user[user_id]
+            if index < len(bucket) and len(picked) < quota:
+                picked.append(bucket[index])
+                progressed = True
+        if not progressed:
+            break
+        index += 1
+    return picked
+
+
+def select_queries(dataset: Any) -> tuple[list[Any], dict[str, int]]:
+    """不可回答全取 + 可回答按 (query_type, user_id) 两级分层定额抽。
+
+    不用随机抽样：配额表与轮转次序都写死，同一个数据集永远得到同一批查询，重跑
+    之间的差异因此只来自 LLM，不来自样本。
+
+    为什么加 query_type 这一层（`RAG-021`）：此前只按 user_id 分层，而数据集里
+    query_id 的编号顺序与 query_type 强相关（每个 user 的简单型排在前面），轮转
+    只取到每人前 3~4 个 index，于是 `cross_chunk` 9 条与 `cross_document` 6 条
+    （占可回答的 37.5%）一条都进不了抽样 —— 抽到的 10 条全是单文档，8 条还是
+    单锚点。`refusal_rate_answerable` 因此只在「单文档单锚点查找」上成立，而
+    `RAG-016` 修的恰是最容易在跨块查询上触发的缺陷：偏差正好避开了该测的那一类。
+
+    不可回答那侧是全取而非抽样，所以 `false_answer_rate`（分母为不可回答数）不
+    受这个偏差影响，受影响的只有 `refusal_rate_answerable`。
+
+    分辨率限制：10 个名额分到 6 个型，每型只有 1~2 条，**不足以报分型指标**，
+    只能报聚合值 + 逐条人工核对。
     """
     unanswerable = sorted(
         (q for q in dataset.queries if q.answerability == "unanswerable"),
         key=lambda q: q.query_id,
     )
-    by_user: dict[str, list[Any]] = {}
-    for query in sorted(
-        (q for q in dataset.queries if q.answerability == "answerable"),
-        key=lambda q: (q.user_id, q.query_id),
-    ):
-        by_user.setdefault(query.user_id, []).append(query)
+    by_type: dict[str, list[Any]] = {}
+    for query in dataset.queries:
+        if query.answerability == "answerable":
+            by_type.setdefault(query.query_type, []).append(query)
 
+    quota = allocate_by_type(
+        {name: len(bucket) for name, bucket in by_type.items()}, ANSWERABLE_SAMPLE
+    )
     answerable: list[Any] = []
-    index = 0
-    while len(answerable) < ANSWERABLE_SAMPLE:
-        added = False
-        for user_id in sorted(by_user):
-            bucket = by_user[user_id]
-            if index < len(bucket) and len(answerable) < ANSWERABLE_SAMPLE:
-                answerable.append(bucket[index])
-                added = True
-        if not added:
-            break
-        index += 1
-    return sorted(unanswerable + answerable, key=lambda q: q.query_id)
+    for offset, name in enumerate(sorted(by_type)):
+        answerable.extend(_rotate_by_user(by_type[name], quota[name], offset=offset))
+    return sorted(unanswerable + answerable, key=lambda q: q.query_id), quota
 
 
 async def answer_one(
@@ -216,7 +289,7 @@ async def run(arguments: argparse.Namespace) -> int:
         raise SystemExit(f"{output} 已存在，换个路径以免覆盖既有结果")
 
     dataset = load_dataset(str(DATASET_MANIFEST))
-    selected = select_queries(dataset)
+    selected, answerable_quota = select_queries(dataset)
     if len(selected) != 20:
         raise SystemExit(f"预期抽到 20 条，实际 {len(selected)} 条")
 
@@ -246,6 +319,9 @@ async def run(arguments: argparse.Namespace) -> int:
     print(f"index_version : {dataset.index_version}")
     print(f"queries       : {len(selected)}（不可回答 "
           f"{sum(q.answerability == 'unanswerable' for q in selected)}）")
+    print("可回答配额    : "
+          + "  ".join(f"{name}={answerable_quota[name]}"
+                      for name in sorted(answerable_quota)))
 
     passes = []
     for attempt in range(1, arguments.repeat + 1):
@@ -301,6 +377,11 @@ async def run(arguments: argparse.Namespace) -> int:
                 "deterministic": False,
                 "index_version": dataset.index_version,
                 "top_k": TOP_K,
+                # RAG-021：抽样构成必须进产物。此前只按 user 分层，跨块/跨文档
+                # 整型缺失且产物里看不出来，读数的人无从判断结论的适用范围。
+                "sampling": "stratified_by_query_type_then_user",
+                "answerable_quota_by_type": answerable_quota,
+                "selected_query_ids": [q.query_id for q in selected],
                 "hyde": "identity_substituted",
                 "reranker": "skipped",
                 "notes": "empty_note_service",
