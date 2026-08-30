@@ -147,6 +147,91 @@ def test_max_documents_rejects_invalid_values() -> None:
             RagService(user_id="u", max_documents=bad)
 
 
+def test_llm_call_timeout_rejects_invalid_values() -> None:
+    """超时同样是评测要扫的参数（`RAG-024`），非法值当场炸。
+
+    `True` 单独挡：`bool` 是 `int` 的子类，会被 `isinstance(x, (int, float))`
+    放过去，于是 `llm_call_timeout_s=True` 静默等于 1 秒 —— 那会让整条曲线上的
+    每次调用都超时，而现象看起来像模型变慢了。
+    """
+    from app.rag.rag_service import RagService
+
+    for bad in (0, -1, -0.5):
+        with pytest.raises(ValueError):
+            RagService(user_id="u", llm_call_timeout_s=bad)
+    for bad in ("30", True, False, None):
+        with pytest.raises(TypeError):
+            RagService(user_id="u", llm_call_timeout_s=bad)
+
+    # 合法取值（含 int）必须放过，并归一化成 float。
+    assert RagService(user_id="u", llm_call_timeout_s=45).llm_call_timeout_s == 45.0
+
+
+def test_both_llm_timeouts_come_from_the_same_parameter() -> None:
+    """map 与 reduce 两道墙必须同源（`RAG-024`）。
+
+    它们原本是两个各自写死的 `30.0`。实测两处都发过火：dev-035 深度 8 第 2 轮
+    map 侧 8 个分支约 7.8s 就走完了，最终却记到 37795 ms —— 撞的是 reduce 那道。
+    只改一处会留下一道看不见的墙，评测扫超时取值时得到的曲线是错的。
+    """
+    from app.rag.rag_service import DEFAULT_LLM_CALL_TIMEOUT_S
+
+    source = (BACKEND_ROOT / "app" / "rag" / "rag_service.py").read_text(
+        encoding="utf-8"
+    )
+    assert source.count("timeout=self.llm_call_timeout_s") == 2, (
+        "map 与 reduce 两处 wait_for 都必须取 self.llm_call_timeout_s"
+    )
+    assert "timeout=30.0" not in source, "不得残留写死的超时字面量"
+    # 默认值不变 = 生产行为逐位不变；改它需要重测，故加门禁。
+    assert DEFAULT_LLM_CALL_TIMEOUT_S == 30.0
+
+
+def test_branch_failures_are_isolated_from_each_other() -> None:
+    """`gather` 必须带 `return_exceptions=True`（`RAG-024`）。
+
+    源码契约测试：这个参数一旦被摘掉，任一分支异常就会报废整条查询连同其余
+    已成功的分支，而现象是「超时率随 max_documents 升高」—— 极难从数据反推。
+    """
+    source = (BACKEND_ROOT / "app" / "rag" / "rag_service.py").read_text(
+        encoding="utf-8"
+    )
+    assert "asyncio.gather(*tasks, return_exceptions=True)" in source, (
+        "分支摘要的 gather 必须隔离单分支失败"
+    )
+
+
+def test_evidence_forbidding_veto_precedes_the_refusal_filter() -> None:
+    """否决必须发生在剔除之前（`RAG-026`）。
+
+    源码顺序契约测试：`usable_summaries` 那个列表推导会把所有 `_is_refusal` 为真
+    的分支丢掉。若否决判定排在它之后，证据禁止型分支已经不在候选里了，否决永远
+    不会触发 —— 而所有单元测试仍可能因为别的路径而通过。顺序本身就是正确性。
+    """
+    source = (BACKEND_ROOT / "app" / "rag" / "rag_service.py").read_text(
+        encoding="utf-8"
+    )
+    veto_at = source.index("forbidding_summaries = [")
+    filter_at = source.index("usable_summaries = [")
+    assert veto_at < filter_at, (
+        "证据禁止型的否决判定必须写在剔除拒答分支之前，否则否决不可能触发"
+    )
+
+
+def test_refusal_kind_reaches_the_eval_row() -> None:
+    """区分必须进产物（`RAG-026`）。
+
+    `RAG-024` 的教训：区分做在生产代码里但评测 row 不记，等于没做 —— 读产物的人
+    无从判断一次正确拒答是「识别了证据禁止」还是「碰巧所有分支都没话说」。
+    """
+    source = (BACKEND_ROOT / "scripts" / "rag008_answer_eval.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"refusal_kind": result.get("refusal_kind")' in source, (
+        "评测 row 必须记录 refusal_kind"
+    )
+
+
 @requires_probe
 def test_production_depth_metrics_match_documented_numbers() -> None:
     """文档 5.2.7 引用的生产深度数字。"""

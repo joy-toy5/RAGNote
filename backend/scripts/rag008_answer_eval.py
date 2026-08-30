@@ -240,6 +240,10 @@ async def answer_one(
             error = "EMPTY_CONTENT"
 
     trace = result.get("retrieval_trace") or {}
+    # RAG-024：分支健康度必须落进产物，否则「部分分支失败下产出的答案/拒答」与
+    # 「证据齐全下产出的同类结果」在产物里不可分辨 —— 那正是本条要修的混淆本身，
+    # 只是从生产返回值搬到了评测记账层。异常兜底路径没有这个键，故给空形状。
+    health = result.get("generation_health") or {}
     return {
         "query_id": query.query_id,
         "user_id": query.user_id,
@@ -253,6 +257,16 @@ async def answer_one(
         "retrieval_gate_fired": bool(trace.get("no_answer")),
         "error": error,
         "wall_time_ms": round(elapsed_ms, 3),
+        "branches_total": health.get("branches_total"),
+        "branches_succeeded": health.get("branches_succeeded"),
+        "branches_failed": health.get("branches_failed"),
+        "branch_degraded": health.get("degraded"),
+        "branch_errors": health.get("branch_errors") or [],
+        # RAG-026：拒答的语义类别。同为 `predicted_no_answer=True`，
+        # `information_missing` 表示「资料里没有这个信息」，`evidence_forbids`
+        # 表示「资料明确说了不能据此判断」。不落进产物的话，无法判断一次正确拒答
+        # 是系统识别了证据不足，还是碰巧所有分支都没话说 —— 而后者不是能力。
+        "refusal_kind": result.get("refusal_kind"),
     }
 
 

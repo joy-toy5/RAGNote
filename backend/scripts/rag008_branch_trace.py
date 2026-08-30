@@ -103,6 +103,9 @@ async def main() -> None:
     print(f"最终 summary: {result.get('summary')!r}")
     print(f"进入生成的文档数: {len(result.get('documents') or [])}")
     print(f"chain 调用次数: {len(calls)}")
+    # `RAG-024`：分支健康度。degraded=True 表示有分支失败，此时的答案（或拒答）
+    # 是在部分证据缺失的情况下产出的，不能与证据齐全的同类结果混记。
+    print(f"generation_health: {result.get('generation_health')}")
     for i, (context, out) in enumerate(calls, 1):
         print(f"\n===== 第 {i} 次 chain 调用 =====")
         print(f"--- context ({len(context)} 字符) ---")
