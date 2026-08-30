@@ -2,7 +2,7 @@ from typing import List, Dict, Any
 import torch
 import os
 from dotenv import load_dotenv
-from sentence_transformers import CrossEncoder
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from modelscope import snapshot_download
 from tqdm import tqdm
 from app.core.logger_handler import logger
@@ -59,30 +59,240 @@ def check_and_download_reranker_model() -> None:
         raise RuntimeError(f"重排序模型检查失败: {str(e)}")
 
 
+# ── Qwen3-Reranker 官方打分口径 ────────────────────────────────────────────────
+# 该系列是**生成式判别器**，不是序列分类模型：checkpoint 里没有标量打分头
+# （310 个张量中无 score/classifier/pooler），config 的 architectures 是
+# ['Qwen3ForCausalLM']。用 CrossEncoder / AutoModelForSequenceClassification 加载
+# 会让 transformers 随机初始化一个 score.weight 并**正常返回**——不抛异常，
+# 打分是噪声，每次进程重启排序都不同。参见 `RAG-013`。
+#
+# 正确口径：按下面的模板拼 prompt，取最后一个位置的 logits，只在 yes / no 两个
+# token 上做 log_softmax，取 yes 的概率作为相关性分数（0~1，higher_is_better）。
+# 不能在全词表（151669）上归一化——那会把分数压到极小且互不可比。
+#
+# 模板必须与模型卡逐字一致：分数就是「assistant 第一个待生成位置」的分布，
+# 改一个字符就换了一个测量口径。末尾那个空的 <think>\n\n</think> 不能省。
+_RERANK_PREFIX = (
+    "<|im_start|>system\nJudge whether the Document meets the requirements based on "
+    'the Query and the Instruct provided. Note that the answer can only be "yes" or '
+    '"no".<|im_end|>\n<|im_start|>user\n'
+)
+_RERANK_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+_RERANK_TASK = (
+    "Given a web search query, retrieve relevant passages that answer the query"
+)
+_RERANK_MAX_LENGTH = 2048
+
+# 加载自检用的样本。刻意选得毫不相干，使判据不依赖模型的精细分辨力。
+# 官方口径实测：相关 ~0.997，不相关 ~0.00005。阈值 0.5 只用来区分「有信号 / 无信号」。
+_SELFTEST_QUERY = "如何重置密码"
+_SELFTEST_RELEVANT = "在设置页面点击“重置密码”，输入原密码后提交。"
+_SELFTEST_IRRELEVANT = "本产品的年度授权费用为每席位 1200 元。"
+_SELFTEST_MIN_MARGIN = 0.5
+
+# 批不变性自检用的长文档：刻意比上面那条短文档长得多，制造大量填充。
+# 单对方向断言抓不住右填充（实测右填充下方向仍对、间隔 0.9700），
+# 右填充真正破坏的是批不变性——同一文档的分数不得取决于同批还有谁。
+_SELFTEST_LONG_FILLER = (
+    "服务器机房位于华东二区，配备双路供电与柴油发电机组。"
+    "机房温度维持在 22 摄氏度，湿度 45% 到 55% 之间。"
+    "所有机柜配备独立配电单元，并接入集中式动环监控系统。"
+    "运维团队按季度演练断电切换流程，演练记录归档保存三年。"
+) * 3
+# 实测：左填充偏差 0.000000000，右填充偏差 0.974795403。
+# 1e-6 远低于故障量级，又给不同平台/精度留了余量。
+_SELFTEST_MAX_BATCH_DRIFT = 1e-6
+
+
+def _format_rerank_input(query: str, document: str) -> str:
+    return (
+        f"<Instruct>: {_RERANK_TASK}\n<Query>: {query}\n<Document>: {document}"
+    )
+
+
 class ReorderService:
     """文档重排序服务"""
-    
+
     def __init__(self):
         self.LOCAL_MODEL_PATH = os.getenv("RERANKER_MODEL_PATH", r"D:\Hugging_Face\models\Qwen3-Reranker-0.6B")
         self.MODELSCOPE_MODEL_NAME = "Qwen/Qwen3-Reranker-0.6B"
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self._model = None
-    
+        self._tokenizer = None
+        self._token_true = None
+        self._token_false = None
+        self._prefix_tokens = None
+        self._suffix_tokens = None
+
     async def _get_model(self):
-        """懒加载模型实例"""
+        """懒加载模型实例。
+
+        加载完成后立刻自检打分方向，不通过就抛异常而不是返回一个会打噪声分的模型。
+        `RAG-013` 的根因是**失败不可见**：静默随机初始化 + `reorder_documents`
+        照常返回 `success=True`，降级路径永不触发，日志和评测产物都看不出异常。
+        这道自检把「静默错」变成「显式炸」，首次加载多一次 forward（CPU 约 0.6s）。
+        """
         if self._model is None:
             actual_model_path = find_model_path(self.LOCAL_MODEL_PATH)
             logger.info(f"✅ 加载重排序模型：{actual_model_path}")
-            self._model = CrossEncoder(
+
+            # padding_side='left' 是硬要求：分数取 logits[:, -1, :]，即序列最后一个
+            # 位置。右填充会让最后一个位置变成 pad token，取到的分布与文档内容无关，
+            # 形态同样是「不报错，分数是噪声」。
+            self._tokenizer = AutoTokenizer.from_pretrained(
                 actual_model_path,
-                max_length=512,
-                device=self.device,
-                local_files_only=True
+                padding_side="left",
+                local_files_only=True,
             )
-            self._model.eval()
+            # `output_loading_info=True` 让 transformers 把「哪些权重不是从
+            # checkpoint 载入的」作为数据交回来，而不是只印一行日志。
+            # `RAG-013` 的原始形态正是这行日志被淹没在启动输出里：
+            # `score.weight | MISSING | newly initialized`，程序照常继续。
+            model, loading_info = AutoModelForCausalLM.from_pretrained(
+                actual_model_path,
+                dtype=torch.float32,
+                local_files_only=True,
+                output_loading_info=True,
+            )
+            self._assert_all_weights_loaded(loading_info)
+            model.eval()
+            model.to(self.device)
+
+            self._token_true = self._tokenizer.convert_tokens_to_ids("yes")
+            self._token_false = self._tokenizer.convert_tokens_to_ids("no")
+            self._prefix_tokens = self._tokenizer.encode(
+                _RERANK_PREFIX, add_special_tokens=False
+            )
+            self._suffix_tokens = self._tokenizer.encode(
+                _RERANK_SUFFIX, add_special_tokens=False
+            )
+            self._model = model
+
+            try:
+                self._assert_scoring_is_sane()
+            except Exception:
+                # 自检失败就不要留下一个半可用的实例：下次调用应重新加载并再次自检，
+                # 而不是复用这个已知有问题的模型。
+                self._model = None
+                self._tokenizer = None
+                raise
+
             logger.info(f"✅ 模型加载成功，使用设备：{self.device}")
         return self._model
-    
+
+    @staticmethod
+    def _assert_all_weights_loaded(loading_info: Dict[str, Any]) -> None:
+        """任何权重未从 checkpoint 载入都必须让加载失败。
+
+        `RAG-013` 验收标准第 4 条：`score.weight MISSING` 一类加载告警必须让启动
+        失败而不是继续。这里不解析日志文本，直接读 transformers 交回的结构化字段。
+        """
+        missing = sorted(loading_info.get("missing_keys") or [])
+        mismatched = sorted(loading_info.get("mismatched_keys") or [])
+        if missing or mismatched:
+            raise RuntimeError(
+                f"重排序模型权重未完整载入，拒绝启动。"
+                f"随机初始化的权重会让打分变成噪声且**不抛异常**——"
+                f"这正是 RAG-013 长期不可见的原因。"
+                f"missing_keys={missing} mismatched_keys={mismatched}"
+            )
+
+    def _assert_scoring_is_sane(self) -> None:
+        """加载自检：方向 + 批不变性。
+
+        两条判据各管一类失败，不能互相替代（实测）：
+          · 方向  -> 抓打分头未从 checkpoint 载入（`RAG-013` 的原始形态，
+                     该情况下方向真的是随机的）；
+          · 批不变性 -> 抓右填充。单对方向断言抓不住右填充：实测右填充下
+                     间隔仍有 0.9700，方向"看起来"是对的。
+
+        `chat template` 写错则两条都抓不住（实测丢掉官方 suffix 后间隔仍有
+        0.7988），只能靠源码层把模板逐字钉死，见
+        `tests/m3/test_reranker_scoring.py` 里的模板哈希断言。
+        """
+        self._assert_direction()
+        self._assert_batch_invariance()
+
+    def _assert_direction(self) -> None:
+        """已知相关必须显著高于已知不相关。"""
+        relevant, irrelevant = self._score_pairs(
+            [
+                _format_rerank_input(_SELFTEST_QUERY, _SELFTEST_RELEVANT),
+                _format_rerank_input(_SELFTEST_QUERY, _SELFTEST_IRRELEVANT),
+            ]
+        )
+        margin = relevant - irrelevant
+        if margin <= _SELFTEST_MIN_MARGIN:
+            raise RuntimeError(
+                f"重排序模型打分自检未通过：已知相关 {relevant:.6f} 未显著高于"
+                f"已知不相关 {irrelevant:.6f}（间隔 {margin:+.6f} <= "
+                f"{_SELFTEST_MIN_MARGIN}）。打分没有相关性信号，拒绝使用该模型。"
+                f"请检查 checkpoint 是否完整、是否被按序列分类模型加载"
+                f"（该系列没有可加载的标量打分头）。详见 RAG-013。"
+            )
+        logger.info(
+            f"✅ 打分方向自检通过：相关 {relevant:.6f} / 不相关 {irrelevant:.6f}"
+            f"（间隔 {margin:+.6f}）"
+        )
+
+    def _assert_batch_invariance(self) -> None:
+        """同一文档的分数不得取决于同批还有谁。
+
+        分数取自 `logits[:, -1, :]`，即序列最后一个位置。左填充下短序列的末位
+        仍是真实 token；右填充下会变成 pad token，取到的分布与文档内容无关，
+        且只在「同批有更长序列」时才发生——单条打分时看不出来。
+        """
+        rendered = _format_rerank_input(_SELFTEST_QUERY, _SELFTEST_RELEVANT)
+        alone = self._score_pairs([rendered])[0]
+        batched = self._score_pairs(
+            [
+                rendered,
+                _format_rerank_input(_SELFTEST_QUERY, _SELFTEST_LONG_FILLER),
+            ]
+        )[0]
+        drift = abs(alone - batched)
+        if drift > _SELFTEST_MAX_BATCH_DRIFT:
+            raise RuntimeError(
+                f"重排序模型批不变性自检未通过：同一文档单独打分 {alone:.9f}，"
+                f"与一条更长文档同批时 {batched:.9f}，偏差 {drift:.9f} > "
+                f"{_SELFTEST_MAX_BATCH_DRIFT:g}。分数受同批其他文档影响，"
+                f"通常是填充方向错了（必须 padding_side='left'，因为分数取"
+                f"序列最后一个位置）。拒绝使用该模型。详见 RAG-013。"
+            )
+        logger.info(f"✅ 批不变性自检通过：偏差 {drift:.9f}")
+
+    @torch.no_grad()
+    def _score_pairs(self, rendered_pairs: List[str]) -> List[float]:
+        """按官方口径打分，返回与输入同序的相关性分数（0~1）。"""
+        tokenizer = self._tokenizer
+        budget = (
+            _RERANK_MAX_LENGTH - len(self._prefix_tokens) - len(self._suffix_tokens)
+        )
+        inputs = tokenizer(
+            rendered_pairs,
+            return_tensors=None,
+            add_special_tokens=False,
+            truncation="longest_first",
+            return_attention_mask=False,
+            max_length=budget,
+        )
+        for index, ids in enumerate(inputs["input_ids"]):
+            inputs["input_ids"][index] = (
+                self._prefix_tokens + ids + self._suffix_tokens
+            )
+        inputs = tokenizer.pad(inputs, padding=True, return_tensors="pt")
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+
+        logits = self._model(**inputs).logits[:, -1, :]
+        # 只在 yes / no 这两个 token 上归一化：分数才落在 0~1 且彼此可比。
+        stacked = torch.stack(
+            [logits[:, self._token_false], logits[:, self._token_true]], dim=1
+        )
+        return (
+            torch.nn.functional.log_softmax(stacked, dim=1)[:, 1].exp().tolist()
+        )
+
+
     @property
     async def model(self):
         """获取模型实例（懒加载）"""
@@ -124,13 +334,18 @@ class ReorderService:
                 else document
                 for document in documents
             ]
-            pairs = [(query, document) for document in rendered_documents]
-            
-            # 使用模型进行批量预测（batch_size=1避免padding令牌报错）
-            model = await self.model
-            # 禁用梯度计算，提高推理性能
-            with torch.no_grad():
-                scores = model.predict(pairs, batch_size=1)
+
+            # 触发懒加载与打分自检；自检不通过会抛出，走下面的降级路径。
+            await self.model
+            # 一次 forward 打完整批。原先写 batch_size=1 是为绕开
+            # `Cannot handle batch sizes > 1 if no padding token is defined.`，
+            # 那个报错本身是 RAG-013 的症状——pad token 从 tokenizer 取即可。
+            scores = self._score_pairs(
+                [
+                    _format_rerank_input(query, document)
+                    for document in rendered_documents
+                ]
+            )
             scores = validate_rerank_scores(scores, len(documents))
             
             # 构建结果列表
