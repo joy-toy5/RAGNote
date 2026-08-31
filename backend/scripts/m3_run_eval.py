@@ -77,6 +77,7 @@ class _RetrievalOnlyRagService:
         top_k: int,
         retriever_mode: str,
         fusion_weights: tuple[float, float] | None = None,
+        rerank: bool = False,
     ) -> None:
         from app.rag.rag_service import RagService
         from app.rag.vector_store import VectorStoreService
@@ -95,9 +96,13 @@ class _RetrievalOnlyRagService:
             vector_store=self._vector_store,
             note_service_override=_EmptyNoteService(),
         )
-        # 不改生产代码，只在评测实例上把两个不可复现阶段替换掉。
+        # 不改生产代码，只在评测实例上把不可复现阶段替换掉。
         service.generate_hypothetical_document = self._identity_hyde
-        service.reorder_documents = self._skip_rerank
+        if not rerank:
+            service.reorder_documents = self._skip_rerank
+        # rerank=True 时**不打桩**，走生产的 RagService.reorder_documents ->
+        # reorder_service。该路径可复现：本地权重、float32、无采样，且加载后
+        # 自检方向与批不变性（`RAG-013`）。模型是模块级单例，50 条 Query 只加载一次。
         if retriever_mode == "vector_only":
             # 消融用：预置检索器，让 initialize_retriever 的 None 判断直接短路，
             # 从而绕开 EnsembleRetriever，不改生产代码。
@@ -180,6 +185,8 @@ class OfflineRagServiceFactory:
         self._index_dir = index_dir
         self._top_k = retrieval_config["top_k"]
         self._mode = mode
+        # 同样从声明里回读，保证「声明启用了重排」与「真的跑了重排」不会分叉。
+        self._rerank = bool(retrieval_config["reranker"]["enabled"])
         # 权重从声明里回读，保证「声明的」与「执行的」是同一份值。
         declared = retrieval_config["retriever"].get("weights")
         self._fusion_weights = (
@@ -201,6 +208,7 @@ class OfflineRagServiceFactory:
             top_k=self._top_k,
             retriever_mode=self._mode,
             fusion_weights=self._fusion_weights,
+            rerank=self._rerank,
         )
         self._issued.append(service)
         return service
@@ -211,10 +219,51 @@ class OfflineRagServiceFactory:
             service.close()
 
 
+def build_reranker_config(enabled: bool) -> dict[str, Any]:
+    """reranker 声明必须写清「用哪个模型、按什么口径打分」。
+
+    `RAG-017` 的教训：影响行为的东西不进指纹就等于没被记录。打分口径由 prompt
+    模板逐字决定（分数是 assistant 第一个待生成位置的 logits 分布），所以把两个
+    模板串的 sha256 也钉进 config —— 换一个字符就是换了一次测量。
+    """
+    if not enabled:
+        return {
+            "enabled": False,
+            "model": "Qwen/Qwen3-Reranker-0.6B",
+            "reason": (
+                "消融基线：不启用重排，与三份既有冻结产物同口径，可直接对照"
+            ),
+        }
+
+    from app.rag.reorder_service import _RERANK_PREFIX, _RERANK_SUFFIX
+
+    def digest(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    return {
+        "enabled": True,
+        "model": "Qwen/Qwen3-Reranker-0.6B",
+        "loader": "AutoModelForCausalLM",
+        "dtype": "float32",
+        "padding_side": "left",
+        # 打分口径：末位 logits 在 yes/no 两个 token 上 log_softmax，取 yes 概率。
+        "scoring": "last_token_yes_no_log_softmax",
+        "prompt_prefix_sha256": digest(_RERANK_PREFIX),
+        "prompt_suffix_sha256": digest(_RERANK_SUFFIX),
+        # 重排不截断：全部候选按分数降序返回，因此 Recall@k 读的是重排后的 top-k。
+        "truncation": "none",
+        "reason": (
+            "RAG-013 打分口径已按模型卡修复（两次独立加载逐位一致、方向间隔 "
+            "+0.996484），本 run 用于回答「工作的 reranker 是否让检索指标回归」"
+        ),
+    }
+
+
 def build_retrieval_config(
     top_k: int,
     mode: str = "hybrid",
     fusion_weights: tuple[float, float] | None = None,
+    rerank: bool = False,
 ) -> dict[str, Any]:
     """所有影响检索结果的开关都必须在这里显式声明，config_sha256 才有意义。"""
     if mode == "hybrid":
@@ -255,14 +304,7 @@ def build_retrieval_config(
             "enabled": False,
             "reason": "LLM 改写不可复现，基线使用原始 query（等价于生产 LLM 失败降级）",
         },
-        "reranker": {
-            "enabled": False,
-            "model": "Qwen/Qwen3-Reranker-0.6B",
-            "reason": (
-                "checkpoint 是 CausalLM，无 score 头；CrossEncoder 会随机初始化 "
-                "score.weight，同一文件两次加载打分不同，排序是噪声而非模型能力"
-            ),
-        },
+        "reranker": build_reranker_config(rerank),
         "note_store": {
             "enabled": False,
             "reason": "笔记向量未版本化，无 provenance 元数据，不得进入正式 qrels",
@@ -337,7 +379,7 @@ async def run(arguments: argparse.Namespace) -> int:
     else:
         weights = None
     retrieval_config = build_retrieval_config(
-        arguments.top_k, arguments.retriever, weights
+        arguments.top_k, arguments.retriever, weights, rerank=arguments.rerank
     )
     backend_root = Path(__file__).resolve().parent.parent
     factory = OfflineRagServiceFactory(
@@ -348,6 +390,7 @@ async def run(arguments: argparse.Namespace) -> int:
     executor = RagServiceQueryExecutor(factory)
 
     print(f"retriever      : {arguments.retriever}")
+    print(f"rerank         : {arguments.rerank}")
     print(f"queries        : {len(dataset.queries)}")
     print(f"index_version  : {dataset.index_version}")
     print(f"config_sha256  : {factory.descriptor.retrieval_config_sha256}")
@@ -389,6 +432,15 @@ def main() -> int:
         choices=("hybrid", "vector_only"),
         default="hybrid",
         help="hybrid 为生产路径；vector_only 为消融基线",
+    )
+    parser.add_argument(
+        "--rerank",
+        action="store_true",
+        help=(
+            "启用 Qwen3-Reranker 重排（RAG-013 已修）。默认关闭，与三份既有冻结"
+            "产物同口径。开启后 config_sha256 变化，两臂必须都在本脚本当前版本下跑"
+            "才可比 —— scripts/m3_*.py 在 FINGERPRINT_PATTERNS 内。"
+        ),
     )
     parser.add_argument(
         "--fusion-weights",

@@ -103,6 +103,10 @@ _SELFTEST_LONG_FILLER = (
 # 1e-6 远低于故障量级，又给不同平台/精度留了余量。
 _SELFTEST_MAX_BATCH_DRIFT = 1e-6
 
+# 单次 forward 的最大条数。上游候选数不受本服务控制，激活内存随批大小线性增长，
+# 这里是内存上限的硬约束。取 8 也保证了 2 条的批不变性自检落在同一次 forward 内。
+_RERANK_MICRO_BATCH = 8
+
 
 def _format_rerank_input(query: str, document: str) -> str:
     return (
@@ -241,10 +245,14 @@ class ReorderService:
         分数取自 `logits[:, -1, :]`，即序列最后一个位置。左填充下短序列的末位
         仍是真实 token；右填充下会变成 pad token，取到的分布与文档内容无关，
         且只在「同批有更长序列」时才发生——单条打分时看不出来。
+
+        长短两条必须落在同一次 forward，所以直接调 `_score_batch` 而不走
+        `_score_pairs` 的微批切分：切分把它们分到两批就没有「同批」可言，自检会
+        变成恒真。
         """
         rendered = _format_rerank_input(_SELFTEST_QUERY, _SELFTEST_RELEVANT)
-        alone = self._score_pairs([rendered])[0]
-        batched = self._score_pairs(
+        alone = self._score_batch([rendered])[0]
+        batched = self._score_batch(
             [
                 rendered,
                 _format_rerank_input(_SELFTEST_QUERY, _SELFTEST_LONG_FILLER),
@@ -261,9 +269,31 @@ class ReorderService:
             )
         logger.info(f"✅ 批不变性自检通过：偏差 {drift:.9f}")
 
-    @torch.no_grad()
     def _score_pairs(self, rendered_pairs: List[str]) -> List[float]:
-        """按官方口径打分，返回与输入同序的相关性分数（0~1）。"""
+        """按官方口径打分，返回与输入同序的相关性分数（0~1）。
+
+        按 `_RERANK_MICRO_BATCH` 分微批。候选条数由上游决定（实测 M3 数据集单条
+        query 可达 30 条），一次性 forward 的激活内存随之线性增长，本机 5 GiB
+        可用内存撑不住 —— 分批是内存上限的保证，不是优化。
+
+        分微批不改变分数：左填充下末位永远是真 token，批组成对结果无影响，这正是
+        `_assert_batch_invariance` 守的性质（实测左填充偏差 0.000000000）。
+        """
+        scores: List[float] = []
+        for start in range(0, len(rendered_pairs), _RERANK_MICRO_BATCH):
+            scores.extend(
+                self._score_batch(rendered_pairs[start : start + _RERANK_MICRO_BATCH])
+            )
+        return scores
+
+    @torch.no_grad()
+    def _score_batch(self, rendered_pairs: List[str]) -> List[float]:
+        """单次 forward 打一批分。批不变性自检直接调它，绕开微批切分。
+
+        自检要验的是「同一条文档在不同批组成下分数是否漂移」，必须保证那两条落在
+        同一次 forward 里。若走 `_score_pairs`，未来把 `_RERANK_MICRO_BATCH` 调成
+        1 就会把自检变成恒真 —— 右填充的唯一探测器会被静默删掉。
+        """
         tokenizer = self._tokenizer
         budget = (
             _RERANK_MAX_LENGTH - len(self._prefix_tokens) - len(self._suffix_tokens)
@@ -283,7 +313,10 @@ class ReorderService:
         inputs = tokenizer.pad(inputs, padding=True, return_tensors="pt")
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
-        logits = self._model(**inputs).logits[:, -1, :]
+        # `logits_to_keep=1` 只对末位做 lm_head 投影。不传的话模型会物化
+        # [batch, seq, 151669] 的 float32 张量：batch=30、seq=600 就是 10.17 GiB，
+        # 本机直接 OOM（exit 137）。而我们只用末位那一行，其余全是白算白占。
+        logits = self._model(**inputs, logits_to_keep=1).logits[:, -1, :]
         # 只在 yes / no 这两个 token 上归一化：分数才落在 0~1 且彼此可比。
         stacked = torch.stack(
             [logits[:, self._token_false], logits[:, self._token_true]], dim=1

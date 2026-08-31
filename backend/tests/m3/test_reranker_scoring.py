@@ -132,6 +132,58 @@ def test_batching_more_than_one_pair_works() -> None:
     assert all(isinstance(s, float) for s in scores)
 
 
+@pytest.mark.external
+def test_micro_batching_does_not_change_scores() -> None:
+    """跨微批边界不得改变分数。
+
+    候选数由上游决定（实测单条 query 可达 30 条），`_score_pairs` 按
+    `_RERANK_MICRO_BATCH` 分批。分批本身必须是纯粹的内存手段：左填充下末位永远
+    是真 token，谁跟谁同批不该影响结果。
+
+    这条用「微批设为 1」与「一次装完」对照。两者若显著不等，说明分数仍受批组成
+    影响 —— 那是右填充那类缺陷的信号，只不过换了个入口。
+
+    比的是容差内相等与排序一致，不是逐位相等：两侧 padding 宽度不同（一次装完
+    要填到最长，逐条打分无填充），归约顺序随之不同，末位差几个 ulp 属正常数值
+    行为。实测最大偏差 3.93e-10，比自检容差 1e-6 低三个数量级，比右填充的
+    0.9748 低九个数量级 —— 复用同一个容差，探测力度不受影响。
+    """
+    from app.rag import reorder_service as module
+
+    _model_path()
+    service = module.ReorderService()
+    try:
+        asyncio.run(service.model)
+        one_shot = service._score_batch(
+            [module._format_rerank_input(QUERY, d) for d in ALL_DOCS]
+        )
+        original = module._RERANK_MICRO_BATCH
+        module._RERANK_MICRO_BATCH = 1
+        try:
+            split = service._score_pairs(
+                [module._format_rerank_input(QUERY, d) for d in ALL_DOCS]
+            )
+        finally:
+            module._RERANK_MICRO_BATCH = original
+    finally:
+        service._model = None
+        service._tokenizer = None
+        gc.collect()
+
+    deviations = [abs(a - b) for a, b in zip(one_shot, split)]
+    assert max(deviations) <= module._SELFTEST_MAX_BATCH_DRIFT, (
+        f"微批切分改变了分数，分批不再是纯内存手段。\n"
+        f"  一次装完: {one_shot}\n  逐条打分: {split}\n"
+        f"  最大偏差: {max(deviations):.6e} > "
+        f"{module._SELFTEST_MAX_BATCH_DRIFT:g}"
+    )
+    # 重排真正在意的是次序。分数即便有浮点抖动，名次也不该动。
+    by_score = sorted(range(len(ALL_DOCS)), key=lambda i: -one_shot[i])
+    assert by_score == sorted(range(len(ALL_DOCS)), key=lambda i: -split[i]), (
+        f"微批切分改变了排序。\n  一次装完: {one_shot}\n  逐条打分: {split}"
+    )
+
+
 def test_scoring_does_not_silently_accept_an_untrained_head() -> None:
     """加载阶段必须拒绝未训练的打分头，而不是继续返回 success。
 
@@ -165,6 +217,24 @@ def test_scoring_does_not_silently_accept_an_untrained_head() -> None:
     assert "_assert_batch_invariance" in source, (
         "必须保留批不变性自检：方向断言抓不住右填充"
         "（实测右填充下间隔仍有 0.9700，方向看起来是对的）"
+    )
+    assert "logits_to_keep=1" in source, (
+        "必须只对末位做 lm_head 投影：不传 logits_to_keep 会物化 "
+        "[batch, seq, 151669] 的 float32 张量，batch=30、seq=600 即 10.17 GiB，"
+        "本机直接被 OOM kill（exit 137）。分数只用末位那一行"
+    )
+    # 批不变性自检必须走单次 forward 的原语。若它改走 `_score_pairs`，把
+    # `_RERANK_MICRO_BATCH` 调成 1 就会把长短两条分到不同批，「同批」不复存在，
+    # 自检恒真通过 —— 右填充的唯一探测器被静默删掉，且没有任何报错。
+    invariance_body = source.split("def _assert_batch_invariance")[1].split(
+        "def _score_pairs"
+    )[0]
+    assert "_score_batch(" in invariance_body, (
+        "批不变性自检必须直接调 _score_batch：走 _score_pairs 的话微批切分"
+        "会把长短两条分开，自检变成恒真"
+    )
+    assert "_score_pairs(" not in invariance_body, (
+        "批不变性自检不得走 _score_pairs：微批大小一变自检就失效"
     )
 
 
