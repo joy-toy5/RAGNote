@@ -155,6 +155,7 @@ def _load_isolated_app(
         ("user", "user_router"),
         ("note_router", "note_router"),
         ("review_router", "review_router"),
+        ("task_router", "task_router"),
     )
     for module_name, attribute_name in router_names:
         modules[f"app.router.{module_name}"] = _module(
@@ -202,6 +203,7 @@ def test_fastapi_app_assembles_without_real_dependencies(
         "/_m0/user/probe",
         "/_m0/note_router/probe",
         "/_m0/review_router/probe",
+        "/_m0/task_router/probe",
     }
     assert expected_probes.issubset(
         {route.path for route in module.app.routes if hasattr(route, "path")}
