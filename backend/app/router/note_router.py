@@ -2,7 +2,7 @@
 笔记管理 API 路由 —— CRUD、搜索、自动标签、内联补全、写作辅助。
 """
 from fastapi.routing import APIRouter
-from fastapi import Depends, Query
+from fastapi import Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -189,8 +189,13 @@ async def regenerate_tags(
     if not note:
         return success_response(message="笔记不存在")
 
-    import asyncio
-    asyncio.create_task(note_service._auto_tag_and_review(note_id, user_id, note.content))
+    try:
+        note_service.schedule_auto_tag(note_id, user_id, note.content)
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=503,
+            detail="后台任务服务正在关闭，标签生成任务未提交",
+        ) from e
     return success_response(message="标签生成任务已提交")
 
 

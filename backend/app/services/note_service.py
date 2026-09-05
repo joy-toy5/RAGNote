@@ -20,6 +20,7 @@ from app.utils.factory import embed_model
 from app.utils.config import chroma_config
 from app.utils.path_tool import get_abstract_path
 from app.core.logger_handler import logger
+from app.core.task_registry import background_tasks
 from app.utils.prompt_loader import load_prompt
 
 NOTES_COLLECTION_NAME = "notes_collection"
@@ -112,10 +113,20 @@ class NoteService:
         except Exception as e:
             logger.error(f"笔记向量化失败 note_id={note_id}: {e}")
 
-        # 触发后台异步标签生成（不阻塞创建响应）
-        asyncio.create_task(self._auto_tag_and_review(note_id, user_id, payload.content))
+        # 正文已提交；关闭期间拒绝后台任务不能把创建结果误报为失败。
+        try:
+            self.schedule_auto_tag(note_id, user_id, payload.content)
+        except RuntimeError as e:
+            logger.warning(f"笔记已创建，但自动标签任务未调度 note_id={note_id}: {e}")
 
         return self._doc_to_response(note)
+
+    def schedule_auto_tag(self, note_id: str, user_id: str, content: str) -> asyncio.Task:
+        """登记一次自动标签任务；关闭时由登记器关闭协程并抛出 RuntimeError。"""
+        return background_tasks.create(
+            self._auto_tag_and_review(note_id, user_id, content),
+            name=f"note-auto-tag:{note_id}",
+        )
 
     async def update_note(self, db: AsyncSession, note_id: str, user_id: str, payload: NoteUpdate) -> Optional[NoteResponse]:
         """
@@ -368,7 +379,7 @@ class NoteService:
         """
         后台异步任务：LLM 分析笔记内容 → 生成标签和分类 → 更新 MySQL → 创建回顾记录。
 
-        此方法在 create_note 结束后通过 asyncio.create_task 执行，
+        创建笔记与手动重打标签统一通过 schedule_auto_tag 登记到后台任务注册表，
         不阻塞用户保存响应。标签延迟出现是设计意图。
         """
         try:
