@@ -60,6 +60,24 @@ def _load_isolated_app(
     async def close_redis() -> None:
         events.append("close_redis")
 
+    class TaskRegistry:
+        def start(self) -> None:
+            events.append("start_tasks")
+
+        async def cancel_and_wait(self, *, timeout: float):
+            assert timeout > 0
+            events.append("stop_tasks")
+            return ()
+
+    class UploadRuntime:
+        def start(self) -> None:
+            events.append("start_uploads")
+
+        async def shutdown(self, *, timeout: float):
+            assert timeout > 0
+            events.append("stop_uploads")
+            return 0
+
     def check_reranker() -> None:
         events.append("check_reranker")
 
@@ -94,6 +112,8 @@ def _load_isolated_app(
         "app.core": _package("app.core"),
         "app.rag": _package("app.rag"),
         "app.utils": _package("app.utils"),
+        "app.core.task_registry": _module("app.core.task_registry", background_tasks=TaskRegistry()),
+        "app.rag.upload_runtime": _module("app.rag.upload_runtime", upload_runtime=UploadRuntime()),
         "app.db.db_config": _module(
             "app.db.db_config",
             check_database_schema=check_database_schema,
@@ -201,6 +221,8 @@ def test_fastapi_app_assembles_without_real_dependencies(
             "init_sessions",
             "connect_redis",
             "check_reranker",
+            "start_tasks",
+            "start_uploads",
         ]
 
     assert events == [
@@ -212,6 +234,10 @@ def test_fastapi_app_assembles_without_real_dependencies(
         "init_sessions",
         "connect_redis",
         "check_reranker",
+        "start_tasks",
+        "start_uploads",
+        "stop_tasks",
+        "stop_uploads",
         "close_redis",
     ]
     assert attempted_dangerous_imports == []

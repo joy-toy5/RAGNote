@@ -1,9 +1,12 @@
+import asyncio
 import time
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, Request
 from starlette.middleware.cors import CORSMiddleware
 
+from app.core.task_registry import background_tasks
+from app.rag.upload_runtime import upload_runtime
 from app.db.db_config import check_database_schema
 from app.db.redis_config import connect_redis, close_redis
 from app.router.chat import chat_router
@@ -90,9 +93,17 @@ async def startup_event():
     # 检查并重排序模型
     check_and_download_reranker_model()
     logger.info("重排序模型检查完成")
+    background_tasks.start()
+    upload_runtime.start()
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """应用关闭时关闭Redis连接"""
-    await close_redis()
-    logger.info("Redis连接已关闭")
+    """进入 teardown 后有界收尾；早期 SIGTERM drain 留给 P3。"""
+    try:
+        await asyncio.gather(
+            background_tasks.cancel_and_wait(timeout=5.0),
+            upload_runtime.shutdown(timeout=5.0),
+        )
+    finally:
+        await close_redis()
+        logger.info("Redis连接已关闭")
