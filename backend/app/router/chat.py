@@ -2,7 +2,7 @@ import uuid
 
 from fastapi.routing import APIRouter
 from fastapi import Depends
-from fastapi.responses import StreamingResponse
+from app.core.streaming_response import ClosingStreamingResponse
 
 from app.agent.agent import get_agent_stream_response
 from app.router.chat_service import ChatService, get_router_service
@@ -25,7 +25,7 @@ async def query_stream(
     """查询Agent流式响应"""
     session_id = request.session_id or str(uuid.uuid4())
 
-    return StreamingResponse(
+    return ClosingStreamingResponse(
         get_agent_stream_response(request.query, session_id, user_id),
         media_type="text/event-stream",
         headers={

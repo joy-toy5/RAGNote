@@ -2,7 +2,9 @@ from typing import List
 
 from fastapi.routing import APIRouter
 from fastapi import UploadFile, File, Depends, HTTPException
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import FileResponse
+
+from app.core.streaming_response import ClosingStreamingResponse
 
 from app.router.knowledge_service import KnowledgeService, get_knowledge_service
 
@@ -49,7 +51,7 @@ async def add_vector_multiple_stream(
         _: None = Depends(rate_limit(limit=3, window=60))
 ):
     """上传多个文件，流式返回处理进度，仅支持TXT、PDF、MD、PPTX、DOCX"""
-    return StreamingResponse(
+    return ClosingStreamingResponse(
         knowledge_service.handle_add_vector_multiple_stream(files, user_id),
         media_type="text/event-stream",
         headers={
