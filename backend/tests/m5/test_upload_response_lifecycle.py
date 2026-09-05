@@ -15,7 +15,9 @@ from fastapi import FastAPI
 from starlette.requests import ClientDisconnect
 
 from app.core.streaming_response import ClosingStreamingResponse
-from test_upload_stream_lifecycle import _indexer, service_module
+import test_upload_stream_lifecycle as upload_lifecycle
+
+service_module = upload_lifecycle.service_module
 
 
 def _load_router(monkeypatch, backend_root, service):
@@ -45,7 +47,7 @@ def test_send_failure_closes_upload_before_gc_and_releases_capacity(
     service_module, monkeypatch, backend_root, with_middleware, spec_version
 ):
     module = service_module
-    _indexer(module, monkeypatch)
+    upload_lifecycle._indexer(module, monkeypatch)
     router = _load_router(monkeypatch, backend_root, module)
     runtime = module.upload_runtime
     acquired = []

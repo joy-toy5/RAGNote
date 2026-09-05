@@ -5,7 +5,6 @@ from fastapi.routing import APIRouter
 from fastapi import Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional
 
 from app.services.note_service import note_service
 from app.schemas.models import (
