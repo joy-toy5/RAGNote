@@ -23,11 +23,14 @@ from app.indexing.models import (
     IndexVersion,
 )
 from app.models import Base
+from app.tasking.models import BackgroundTask, TaskAttempt
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
+
+TASKING_MODELS = (BackgroundTask, TaskAttempt)
 
 INDEXING_MODELS = (
     ContentBlob,

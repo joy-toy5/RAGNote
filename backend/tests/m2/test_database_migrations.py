@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
+import json
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.engine import Engine
 
 from app.db.database_url import build_database_url
 from app.db.migration_guard import (
@@ -26,6 +32,35 @@ from app.db.schema_gate import (
 )
 from app.models import Base
 import app.db.schema_gate as schema_gate
+
+BUSINESS_TABLE_NAMES = {
+    "background_tasks",
+    "chat_messages",
+    "chat_sessions",
+    "content_blobs",
+    "document_revisions",
+    "documents",
+    "index_chunks",
+    "index_versions",
+    "notes",
+    "review_records",
+    "task_attempts",
+}
+
+
+@pytest.fixture
+def engine() -> Iterator[Engine]:
+    """迁移只运行在开启外键的一次性内存库。"""
+    disposable_engine = create_engine("sqlite:///:memory:")
+
+    @event.listens_for(disposable_engine, "connect")
+    def enable_foreign_keys(connection: Any, _record: Any) -> None:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+    try:
+        yield disposable_engine
+    finally:
+        disposable_engine.dispose()
 
 
 def _alembic_config(backend_root: Path, connection: Any) -> Config:
@@ -85,8 +120,8 @@ def test_migration_target_requires_exact_database_and_non_test_acknowledgement()
 
 def test_migration_guard_binds_legacy_preflight_stamp_and_downgrade(
     backend_root: Path,
+    engine: Engine,
 ) -> None:
-    engine = create_engine("sqlite:///:memory:")
     with engine.begin() as connection:
         command.upgrade(_alembic_config(backend_root, connection), "0001_legacy")
         connection.execute(text("DROP TABLE alembic_version"))
@@ -107,50 +142,109 @@ def test_migration_guard_binds_legacy_preflight_stamp_and_downgrade(
 
 
 def test_models_register_one_complete_metadata_contract() -> None:
-    assert set(Base.metadata.tables) == {
-        "chat_messages",
-        "chat_sessions",
-        "content_blobs",
-        "document_revisions",
-        "documents",
-        "index_chunks",
-        "index_versions",
-        "notes",
-        "review_records",
-    }
+    assert set(Base.metadata.tables) == BUSINESS_TABLE_NAMES
+    assert all(model.metadata is Base.metadata for model in schema_gate.TASKING_MODELS)
+
+
+def test_schema_revision_matches_the_single_alembic_head(backend_root: Path) -> None:
+    scripts = ScriptDirectory.from_config(Config(str(backend_root / "alembic.ini")))
+
+    assert EXPECTED_SCHEMA_REVISION == "0003_task_lifecycle"
+    assert scripts.get_heads() == [EXPECTED_SCHEMA_REVISION]
+    assert (
+        scripts.get_revision(EXPECTED_SCHEMA_REVISION).down_revision
+        == "0002_index_contract"
+    )
+
+
+@pytest.mark.parametrize(
+    "first_import", ["app.models", "app.indexing.models", "app.tasking.models"]
+)
+@pytest.mark.parametrize("composition_root", ["schema_gate", "alembic"])
+def test_composition_roots_register_all_models_in_a_cold_process(
+    backend_root: Path,
+    tmp_path: Path,
+    first_import: str,
+    composition_root: str,
+) -> None:
+    script = """
+import importlib
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[1])
+importlib.import_module(sys.argv[2])
+from app.models import Base
+if sys.argv[2] == "app.models":
+    assert set(Base.metadata.tables) == {"chat_messages", "chat_sessions", "notes", "review_records"}
+    assert "app.indexing.models" not in sys.modules
+    assert "app.tasking.models" not in sys.modules
+if sys.argv[3] == "schema_gate":
+    import app.db.schema_gate
+else:
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import create_engine
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        config = Config(str(Path(sys.argv[1]) / "alembic.ini"))
+        config.attributes["connection"] = connection
+        command.upgrade(config, "head")
+    engine.dispose()
+print(json.dumps(sorted(Base.metadata.tables)))
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            script,
+            str(backend_root),
+            first_import,
+            composition_root,
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=True,
+    )
+
+    assert json.loads(result.stdout) == sorted(BUSINESS_TABLE_NAMES)
 
 
 def test_legacy_baseline_upgrades_downgrades_and_reupgrades(
     backend_root: Path,
+    engine: Engine,
 ) -> None:
-    engine = create_engine("sqlite:///:memory:")
     with engine.begin() as connection:
         config = _alembic_config(backend_root, connection)
+        assert connection.scalar(text("PRAGMA foreign_keys")) == 1
 
         command.upgrade(config, "head")
         validate_schema_compatibility(connection)
-        assert set(inspect(connection).get_table_names()) == {
-            "alembic_version",
-            "chat_messages",
-            "chat_sessions",
-            "content_blobs",
-            "document_revisions",
-            "documents",
-            "index_chunks",
-            "index_versions",
-            "notes",
-            "review_records",
+        assert set(inspect(connection).get_table_names()) == BUSINESS_TABLE_NAMES | {
+            "alembic_version"
         }
+        assert (
+            connection.scalar(text("SELECT version_num FROM alembic_version"))
+            == EXPECTED_SCHEMA_REVISION
+        )
 
         command.downgrade(config, "base")
         assert inspect(connection).get_table_names() == ["alembic_version"]
+        assert connection.scalar(text("SELECT count(*) FROM alembic_version")) == 0
 
         command.upgrade(config, "head")
         validate_schema_compatibility(connection)
 
 
-def test_unversioned_legacy_schema_requires_explicit_preflight_mode() -> None:
-    engine = create_engine("sqlite:///:memory:")
+def test_unversioned_legacy_schema_requires_explicit_preflight_mode(
+    engine: Engine,
+) -> None:
     with engine.begin() as connection:
         backend_root = Path(__file__).resolve().parents[2]
         command.upgrade(_alembic_config(backend_root, connection), "0001_legacy")
@@ -166,8 +260,8 @@ def test_unversioned_legacy_schema_requires_explicit_preflight_mode() -> None:
 
 def test_migration_guard_rejects_restamping_versioned_database(
     backend_root: Path,
+    engine: Engine,
 ) -> None:
-    engine = create_engine("sqlite:///:memory:")
     with engine.begin() as connection:
         command.upgrade(_alembic_config(backend_root, connection), "head")
 
@@ -180,12 +274,17 @@ def test_migration_guard_rejects_restamping_versioned_database(
             )
 
 
-def test_schema_gate_rejects_unknown_revision(backend_root: Path) -> None:
-    engine = create_engine("sqlite:///:memory:")
+@pytest.mark.parametrize("revision", ["0002_index_contract", "9999_unknown"])
+def test_schema_gate_rejects_unknown_revision(
+    backend_root: Path,
+    engine: Engine,
+    revision: str,
+) -> None:
     with engine.begin() as connection:
         command.upgrade(_alembic_config(backend_root, connection), "head")
         connection.execute(
-            text("UPDATE alembic_version SET version_num = '9999_unknown'")
+            text("UPDATE alembic_version SET version_num = :revision"),
+            {"revision": revision},
         )
 
         with pytest.raises(SchemaCompatibilityError, match="revision 不兼容"):
@@ -197,16 +296,25 @@ def test_schema_gate_rejects_unknown_revision(backend_root: Path) -> None:
     [
         ("get_unique_constraints", "documents", "唯一约束"),
         ("get_check_constraints", "content_blobs", "CHECK 约束"),
+        ("get_unique_constraints", "background_tasks", "唯一约束"),
+        ("get_check_constraints", "background_tasks", "CHECK 约束"),
+        ("get_check_constraints", "task_attempts", "CHECK 约束"),
+        ("get_foreign_keys", "background_tasks", "外键"),
+        ("get_foreign_keys", "task_attempts", "外键"),
+        ("get_indexes", "background_tasks", "索引"),
+        ("get_indexes", "task_attempts", "索引"),
+        ("get_pk_constraint", "task_attempts", "主键"),
+        ("get_columns", "background_tasks", "列集合"),
     ],
 )
 def test_schema_gate_rejects_missing_fact_constraints(
     backend_root: Path,
+    engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
     method_name: str,
     table_name: str,
     message: str,
 ) -> None:
-    engine = create_engine("sqlite:///:memory:")
     with engine.begin() as connection:
         command.upgrade(_alembic_config(backend_root, connection), "head")
         real_inspector = inspect(connection)
@@ -214,9 +322,12 @@ def test_schema_gate_rejects_missing_fact_constraints(
         class InspectorProxy:
             def __getattr__(self, name: str) -> Any:
                 if name == method_name:
-                    return lambda requested_table: [] if requested_table == table_name else getattr(
-                        real_inspector, name
-                    )(requested_table)
+                    missing_contract = {} if method_name == "get_pk_constraint" else []
+                    return lambda requested_table: (
+                        missing_contract
+                        if requested_table == table_name
+                        else getattr(real_inspector, name)(requested_table)
+                    )
                 return getattr(real_inspector, name)
 
         monkeypatch.setattr(
@@ -238,8 +349,9 @@ def test_schema_gate_requires_mysql_check_enforcement() -> None:
         schema_gate._validate_database_capabilities(unsupported)  # type: ignore[arg-type]
 
 
-def test_schema_gate_only_emits_read_statements(backend_root: Path) -> None:
-    engine = create_engine("sqlite:///:memory:")
+def test_schema_gate_only_emits_read_statements(
+    backend_root: Path, engine: Engine
+) -> None:
     statements: list[str] = []
     with engine.begin() as connection:
         command.upgrade(_alembic_config(backend_root, connection), "head")

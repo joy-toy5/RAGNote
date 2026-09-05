@@ -14,12 +14,14 @@ from app.indexing.models import (
     IndexVersion,
 )
 from app.models import Base
+from app.tasking.models import BackgroundTask, TaskAttempt
 
-EXPECTED_SCHEMA_REVISION = "0002_index_contract"
+EXPECTED_SCHEMA_REVISION = "0003_task_lifecycle"
 VERSION_TABLE = "alembic_version"
 LEGACY_TABLE_NAMES = frozenset(
     {"chat_messages", "chat_sessions", "notes", "review_records"}
 )
+TASKING_MODELS = (BackgroundTask, TaskAttempt)
 INDEXING_MODELS = (
     ContentBlob,
     DocumentRevision,
