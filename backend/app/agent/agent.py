@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import anyio
 from langsmith import traceable
 from typing import List, Optional, AsyncGenerator
 
@@ -15,6 +16,7 @@ from app.agent.agent_tools import rag_summary_tools, what_time_is_now, get_user_
     search_notes_tool, get_note_stats_tool, get_today_reviews_tool, mark_reviewed_tool, \
     create_note_tool, get_related_notes_tool, bind_tool_context, ToolContext
 from app.core.logger_handler import logger
+from app.core.task_registry import background_tasks, cancel_task
 from app.services import session_manager as sm
 from app.utils.factory import build_aliyun_chat_model
 from app.utils.prompt_loader import load_prompt
@@ -259,12 +261,14 @@ async def get_agent_stream_response(
     :return: 流式响应生成器
     """
     
-    thinking_queue = asyncio.Queue()
+    thinking_queue = asyncio.Queue(maxsize=128)
+    stream_closed = False
     agent_result_holder = {"response": None, "error": None}
-    agent_done = asyncio.Event()
     
     async def thinking_callback(data: dict):
         """思考过程回调函数，将事件放入队列"""
+        if stream_closed:
+            return
         logger.info(f"【思考过程】{data.get('stage', 'unknown')}: {data.get('content', '')}")
         await thinking_queue.put(data)
     
@@ -306,20 +310,19 @@ async def get_agent_stream_response(
         except Exception as e:
             logger.error(f"【Agent流式响应】Agent执行失败: {e}", exc_info=True)
             agent_result_holder["error"] = str(e)
-        finally:
-            agent_done.set()
     
-    # 启动 Agent 执行任务
-    agent_task = asyncio.create_task(run_agent())
+    agent_task = None
     
     try:
+        # 启动 Agent 执行任务
+        agent_task = background_tasks.create(run_agent(), name="agent-stream")
         logger.info(f"【Agent流式响应】开始处理请求，用户ID: {user_id}, 会话ID: {session_id}, 查询: {query}")
 
         # 先发送初始响应
         yield f"data: {json.dumps({'type': 'response', 'content': '', 'session_id': session_id}, ensure_ascii=False)}\n\n"
         
         # 持续监听队列并实时推送思考事件，同时等待 Agent 完成
-        while not agent_done.is_set():
+        while not agent_task.done():
             try:
                 # 使用短超时轮询队列，实现实时推送
                 event = await asyncio.wait_for(thinking_queue.get(), timeout=0.1)
@@ -365,13 +368,14 @@ async def get_agent_stream_response(
     except Exception as e:
         logger.error(f"【Agent流式响应】处理请求失败: {e}", exc_info=True)
         
-        # 取消 agent 任务
-        agent_task.cancel()
-        try:
-            await agent_task
-        except asyncio.CancelledError:
-            pass
-        
         error_message = f"错误: {str(e)}"
         yield f"data: {json.dumps({'type': 'error', 'content': error_message, 'session_id': session_id}, ensure_ascii=False)}\n\n"
         yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+    finally:
+        # 先关闭回调入口，避免工具取消清理时再次阻塞在已无人消费的满队列。
+        stream_closed = True
+        if agent_task is not None:
+            with anyio.CancelScope(shield=True):
+                task_stopped = await cancel_task(agent_task)
+            if not task_stopped:
+                logger.warning("【Agent流式响应】取消等待超时，任务尚未结束，仍由注册表跟踪")
