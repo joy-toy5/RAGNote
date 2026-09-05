@@ -1,17 +1,19 @@
+import asyncio
 import base64
 import time
 import magic
 import os
 from typing import AsyncGenerator, List
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 
 from fastapi import HTTPException, UploadFile
 
 from app.core.logger_handler import logger
 from app.rag.vector_store import VectorStoreService
 from app.rag.indexing_service import UploadIndexingService
-from app.rag.task_queue import TaskQueue
+from app.rag.task_queue import TaskQueue, QueueClosed
+from app.rag.upload_runtime import UploadLease, upload_runtime
 from app.rag.sse_models import SSEEvent, SliceResult
 
 
@@ -24,6 +26,8 @@ ALLOWED_MIME_TYPES = {
 }
 MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_FOLDER_SIZE = 200 * 1024 * 1024
+MAX_UPLOAD_FILES = 100
+UPLOAD_WAIT_TIMEOUT = 300.0
 
 
 @dataclass
@@ -51,30 +55,32 @@ def _sync_slice_file(
     user_id: str,
     media_type: str,
     queue: TaskQueue,
+    store: VectorStoreService,
 ):
-    """在 ThreadPoolExecutor 中执行的同步切片函数"""
+    """线程只负责 stage/parse；关闭后不再继续下一阶段或堵住 put。"""
     try:
-        store = VectorStoreService()
-        indexer = UploadIndexingService(store)
-        staged = indexer.stage_upload(
-            file_content,
-            filename=filename,
-            user_id=user_id,
-            media_type=media_type,
-        )
-        prepared = indexer.prepare_upload_sync(staged)
-        queue.put(
-            SliceResult.success_result(
-                file_index=file_index,
-                filename=filename,
-                documents=list(prepared.documents),
-                md5=prepared.legacy_md5,
+        if queue.closed:
+            return
+        try:
+            indexer = UploadIndexingService(store)
+            staged = indexer.stage_upload(
+                file_content, filename=filename, user_id=user_id, media_type=media_type,
+            )
+            if queue.closed:
+                return
+            prepared = indexer.prepare_upload_sync(staged)
+            result = SliceResult.success_result(
+                file_index=file_index, filename=filename,
+                documents=list(prepared.documents), md5=prepared.legacy_md5,
                 prepared_upload=prepared,
             )
-        )
-    except Exception as e:
-        logger.error(f"【SSE上传】切片文件 {filename} 时出错: {e}")
-        queue.put(SliceResult.error_result(file_index=file_index, filename=filename, error=str(e)))
+        except Exception as exc:
+            logger.error(f"【SSE上传】切片文件 {filename} 时出错: {exc}")
+            result = SliceResult.error_result(file_index=file_index, filename=filename, error=str(exc))
+        queue.put(result)
+    except QueueClosed:
+        # 已解析的 blob 保留；放弃通知不等于撤销已经发生的持久化。
+        return
 
 
 class KnowledgeService:
@@ -254,10 +260,12 @@ class KnowledgeService:
         failed_count = 0
 
         for current_index, file in enumerate(files, start=1):
-            content = await file.read()
+            content = await file.read(min(MAX_FILE_SIZE + 1, MAX_FOLDER_SIZE - total_size + 1))
             file_size = len(content)
             total_size += file_size
             await file.seek(0)
+            if total_size > MAX_FOLDER_SIZE:
+                return [], [self._yield_size_error_event()], total_files
 
             if file_size > MAX_FILE_SIZE:
                 failed_count += 1
@@ -275,10 +283,6 @@ class KnowledgeService:
                 'content': content,
                 'file_index': current_index
             })
-
-        if total_size > MAX_FOLDER_SIZE:
-            logger.error(f"【SSE上传】文件总大小超过限制，总大小: {total_size / (1024 * 1024):.2f}MB，限制: 200MB")
-            return [], [self._yield_size_error_event()], total_files
 
         mime = magic.Magic(mime=True)
         valid_files = []
@@ -309,128 +313,126 @@ class KnowledgeService:
         return valid_files, error_events, total_files
 
     def _start_slicing(
-        self, valid_files: List[dict], user_id: str
-    ) -> tuple[TaskQueue, ThreadPoolExecutor, list]:
-        """启动多线程切片，返回 (队列, 执行器, future列表)"""
-        queue = TaskQueue(maxsize=10)
-        queue.set_total_count(len(valid_files))
-
-        slice_tasks = [
-            (
-                info['content'],
-                info['filename'],
-                info['file_index'],
-                user_id,
-                info['media_type'],
+        self, valid_files: List[dict], user_id: str, lease: UploadLease,
+        store: VectorStoreService,
+    ) -> list[Future]:
+        """共享池最多四个解析线程；批次文件数与并行批次数均已限额。"""
+        return [
+            lease.submit(
+                _sync_slice_file, info['content'], info['filename'], info['file_index'],
+                user_id, info['media_type'], lease.queue, store,
             )
             for info in valid_files
         ]
 
-        max_workers = min(len(slice_tasks), max(1, os.cpu_count() or 1))
-        logger.info(f"【SSE上传】切片阶段使用 {max_workers} 个线程")
-
-        executor = ThreadPoolExecutor(max_workers=max_workers)
-        futures = [executor.submit(_sync_slice_file, *args, queue) for args in slice_tasks]
-
-        return queue, executor, futures
+    async def _next_slice_result(self, queue: TaskQueue, futures: list[Future]) -> SliceResult:
+        deadline = time.monotonic() + UPLOAD_WAIT_TIMEOUT
+        while True:
+            try:
+                return await queue.get_async(timeout=min(0.1, max(0, deadline - time.monotonic())))
+            except TimeoutError:
+                for future in futures:
+                    if future.done():
+                        # 暴露未投递结果的异常，不能被空队列轮询吞掉。
+                        future.result()
+                if all(future.done() for future in futures) and queue.empty():
+                    raise RuntimeError("解析线程已结束，但缺少文件处理结果") from None
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("等待解析超时；已开始的同步操作可能仍在执行，请勿自动重试") from None
 
     async def _process_slice_results(
-        self, queue: TaskQueue, valid_count: int, store: VectorStoreService,
+        self, lease: UploadLease, futures: list[Future], store: VectorStoreService,
         state: ProcessingState,
     ) -> AsyncGenerator[str, None]:
-        """消费切片队列 → 写入向量库 → yield SSE 进度事件"""
+        """异步消费解析结果；写入一旦开始，断开也保留其真实执行句柄。"""
         indexer = UploadIndexingService(store)
-        while state.written_count < valid_count:
+        while state.written_count < state.total_valid:
+            result = await self._next_slice_result(lease.queue, futures)
             try:
-                result = queue.get(block=True, timeout=0.1)
-
                 state.sliced_count += 1
-
-                if result.success:
-                    state.slice_success_count += 1
-
-                    yield self._yield_slicing_completed_event(result, state)
-
-                    try:
-                        yield self._yield_writing_event(result, state)
-
-                        if result.prepared_upload is None:
-                            raise RuntimeError("切片结果缺少 durable upload 契约")
-                        await indexer.persist_and_index(result.prepared_upload)
-
-                        state.success_count += 1
-                        state.written_count += 1
-
-                        yield self._yield_completed_event(result, state)
-                        logger.info(f"【SSE上传】文件 {result.filename} 写入完成")
-
-                    except Exception as e:
-                        state.written_count += 1
-                        state.failed_count += 1
-                        logger.error(f"【SSE上传】写入文件 {result.filename} 时出错: {e}")
-                        yield self._yield_write_error_event(result, state, str(e))
-
-                else:
+                if not result.success:
                     state.written_count += 1
                     state.failed_count += 1
-                    logger.error(f"【SSE上传】切片文件 {result.filename} 失败: {result.error}")
                     yield self._yield_slice_error_event(result, state)
+                    continue
 
-                queue.task_done()
-
-            except Exception:
-                continue
+                state.slice_success_count += 1
+                yield self._yield_slicing_completed_event(result, state)
+                yield self._yield_writing_event(result, state)
+                if lease.queue.closed:
+                    raise QueueClosed("上传正在关闭，未开始本次索引写入")
+                try:
+                    if result.prepared_upload is None:
+                        raise RuntimeError("切片结果缺少 durable upload 契约")
+                    write = asyncio.create_task(indexer.persist_and_index(result.prepared_upload), name="upload-index")
+                    lease.track_write(write)
+                except Exception as exc:
+                    state.written_count += 1
+                    state.failed_count += 1
+                    logger.error(f"【SSE上传】写入文件 {result.filename} 时出错: {exc}")
+                    yield self._yield_write_error_event(result, state, str(exc))
+                else:
+                    # 只让出等待器，不取消含 to_thread 的索引协程。
+                    _, pending = await asyncio.wait(
+                        {write}, timeout=UPLOAD_WAIT_TIMEOUT
+                    )
+                    if pending:
+                        raise TimeoutError("等待索引超时；写入仍可能执行，请勿自动重试")
+                    try:
+                        write.result()
+                    except Exception as exc:
+                        state.written_count += 1
+                        state.failed_count += 1
+                        logger.error(f"【SSE上传】写入文件 {result.filename} 时出错: {exc}")
+                        yield self._yield_write_error_event(result, state, str(exc))
+                    else:
+                        state.written_count += 1
+                        state.success_count += 1
+                        yield self._yield_completed_event(result, state)
+            finally:
+                lease.queue.task_done()
 
     async def handle_add_vector_multiple_stream(
-        self,
-        files: List[UploadFile],
-        user_id: str
+        self, files: List[UploadFile], user_id: str,
     ) -> AsyncGenerator[str, None]:
-        """
-        处理多个文件上传并返回流式进度（多线程切片 + 单线程串行写入）
-        """
+        """流式上传的进程内容量/取消边界；不是持久接单接口。"""
         total_files = len(files)
-        logger.info(f"【SSE上传】开始处理文件上传，文件数量: {total_files}，用户ID: {user_id}")
-
-        yield self._yield_start_event(total_files)
-
-        # 文件验证
-        valid_files, error_events, _ = await self._validate_and_read_files(files)
-        for event in error_events:
-            yield event
-
-        if not valid_files:
-            logger.info("【SSE上传】无有效文件可处理")
-            return
-
         start_time = time.time()
-        state = ProcessingState(
-            total_files=total_files,
-            total_valid=len(valid_files)
-        )
+        lease = None
+        results = None
+        yield self._yield_start_event(total_files)
+        try:
+            if total_files > MAX_UPLOAD_FILES:
+                raise ValueError(f"单批上传不能超过{MAX_UPLOAD_FILES}个文件")
+            # 先占容量，再将 UploadFile 读成 bytes，拒绝请求不排无限长队。
+            lease = upload_runtime.acquire()
+            valid_files, error_events, _ = await self._validate_and_read_files(files)
+            for event in error_events:
+                yield event
+            if not valid_files:
+                yield self._yield_finish_event(start_time, total_files, 0, total_files)
+                return
 
-        # 多线程切片
-        queue, executor, _ = self._start_slicing(valid_files, user_id)
-
-        # 串行消费 + 写入
-        store = VectorStoreService()
-        async for sse in self._process_slice_results(
-            queue,
-            len(valid_files),
-            store,
-            state,
-        ):
-            yield sse
-
-        executor.shutdown(wait=True)
-
-        logger.info(
-            f"【SSE上传】文件处理完成，总数: {total_files}，"
-            f"成功: {state.success_count}，失败: {state.failed_count}，"
-            f"耗时: {round(time.time() - start_time, 2)}秒"
-        )
-
-        yield self._yield_finish_event(start_time, total_files, state.success_count, state.failed_count)
+            state = ProcessingState(
+                total_files=total_files, total_valid=len(valid_files),
+                failed_count=total_files - len(valid_files),
+            )
+            store = VectorStoreService()
+            futures = self._start_slicing(valid_files, user_id, lease, store)
+            results = self._process_slice_results(lease, futures, store, state)
+            async for event in results:
+                yield event
+            yield self._yield_finish_event(start_time, total_files, state.success_count, state.failed_count)
+        except Exception as exc:
+            logger.error(f"【SSE上传】批次执行中断: {exc}")
+            yield SSEEvent(event_type='error', message='上传处理中断', error_message=str(exc)).to_sse()
+        finally:
+            try:
+                if results is not None:
+                    await results.aclose()
+            finally:
+                if lease is not None:
+                    lease.close()
 
     def _calculate_progress(self, sliced_count: int, written_count: int, total: int) -> int:
         if total == 0:

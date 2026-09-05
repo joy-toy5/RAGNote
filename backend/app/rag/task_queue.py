@@ -1,98 +1,93 @@
+"""同步生产者到异步消费者的有界桥接；关闭表示放弃剩余结果。"""
+
+import asyncio
 import queue
 import threading
-from typing import Any, Optional
+import time
+from typing import Any
+
+
+class QueueClosed(RuntimeError):
+    """消费者已经退出，不再接收或等待结果。"""
 
 
 class TaskQueue:
-    """
-    线程安全的任务队列管理器
-    
-    用于协调多线程切片和单线程写入之间的数据传递
-    """
-    
-    def __init__(self, maxsize: int = 100):
-        """
-        初始化任务队列
-        
-        :param maxsize: 队列最大容量，超过时put会阻塞
-        """
+    def __init__(self, maxsize: int = 2):
+        if maxsize < 1:
+            raise ValueError("队列容量必须大于零")
         self._queue = queue.Queue(maxsize=maxsize)
-        self._completed_count = 0
-        self._total_count = 0
+        self._closed = threading.Event()
         self._lock = threading.Lock()
-        self._finished = False
-    
-    def set_total_count(self, count: int):
-        """
-        设置总任务数
-        
-        :param count: 总任务数量
-        """
+
+    @property
+    def closed(self) -> bool:
+        return self._closed.is_set()
+
+    def put(self, item: Any, block: bool = True, timeout: float | None = None):
+        """有界等待空间，消费者关闭后唤醒生产线程。"""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            with self._lock:
+                if self.closed:
+                    raise QueueClosed("上传结果队列已关闭")
+                try:
+                    self._queue.put_nowait(item)
+                    return
+                except queue.Full:
+                    if not block or (
+                        deadline is not None and time.monotonic() >= deadline
+                    ):
+                        raise
+            self._closed.wait(0.01)
+
+    def get(self, block: bool = True, timeout: float | None = None) -> Any:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            with self._lock:
+                if self.closed:
+                    raise QueueClosed("上传结果队列已关闭")
+                try:
+                    return self._queue.get_nowait()
+                except queue.Empty:
+                    if not block or (
+                        deadline is not None and time.monotonic() >= deadline
+                    ):
+                        raise
+            self._closed.wait(0.01)
+
+    async def get_async(self, timeout: float | None = None) -> Any:
+        """只捕获暂时无结果，不在线程池里留下不可取消的 get。"""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            try:
+                return self.get(block=False)
+            except queue.Empty:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("等待上传解析结果超时") from None
+                await asyncio.sleep(0.01)
+
+    def close(self) -> None:
+        """幂等关闭，丢弃未领取结果；已领取结果仍由消费者 task_done。"""
         with self._lock:
-            self._total_count = count
-    
-    def put(self, item: Any, block: bool = True, timeout: Optional[float] = None):
-        """
-        向队列中放入任务结果
-        
-        :param item: 任务结果数据
-        :param block: 是否阻塞等待
-        :param timeout: 超时时间
-        """
-        self._queue.put(item, block=block, timeout=timeout)
-    
-    def get(self, block: bool = True, timeout: Optional[float] = None) -> Any:
-        """
-        从队列中获取任务结果
-        
-        :param block: 是否阻塞等待
-        :param timeout: 超时时间
-        :return: 任务结果数据
-        """
-        return self._queue.get(block=block, timeout=timeout)
-    
-    def task_done(self):
-        """标记一个任务已处理完成"""
-        with self._lock:
-            self._completed_count += 1
+            self._closed.set()
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._queue.task_done()
+
+    def task_done(self) -> None:
         self._queue.task_done()
-    
-    def get_completed_count(self) -> int:
-        """获取已完成任务数"""
-        with self._lock:
-            return self._completed_count
-    
-    def get_total_count(self) -> int:
-        """获取总任务数"""
-        with self._lock:
-            return self._total_count
-    
-    def is_finished(self) -> bool:
-        """
-        判断是否所有任务都已完成
-        
-        :return: 是否完成
-        """
-        with self._lock:
-            return self._finished and self._completed_count >= self._total_count
-    
-    def set_finished(self):
-        """标记切片阶段已完成"""
-        with self._lock:
-            self._finished = True
-    
-    def join(self):
-        """阻塞直到所有任务都被处理完成"""
+
+    def join(self) -> None:
         self._queue.join()
-    
+
     def qsize(self) -> int:
-        """获取队列当前大小"""
         return self._queue.qsize()
-    
+
     def empty(self) -> bool:
-        """判断队列是否为空"""
         return self._queue.empty()
-    
+
     def full(self) -> bool:
-        """判断队列是否已满"""
         return self._queue.full()
