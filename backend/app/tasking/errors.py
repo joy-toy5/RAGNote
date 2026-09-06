@@ -15,3 +15,7 @@ class TaskIdempotencyConflict(TaskError):
 
 class TaskStateConflict(TaskError):
     """请求与任务当前状态不兼容。"""
+
+
+class TaskLeaseLost(TaskStateConflict):
+    """执行凭据陈旧或租约到期，旧执行不得续约或结算。"""
