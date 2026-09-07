@@ -119,7 +119,8 @@ class ReviewService:
         """
         raw = ""
         try:
-            from app.utils.factory import chat_model
+            from app.utils.factory import get_chat_model
+            chat_model = get_chat_model()
             from app.utils.prompt_loader import load_prompt
             from langchain_core.messages import HumanMessage
 

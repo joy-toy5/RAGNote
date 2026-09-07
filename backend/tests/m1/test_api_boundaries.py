@@ -117,7 +117,7 @@ def _load_note_service(
         "app.models.review_record": _module(
             "app.models.review_record", ReviewRecord=type("ReviewRecord", (), {})
         ),
-        "app.utils.factory": _module("app.utils.factory", embed_model=object()),
+        "app.utils.factory": _module("app.utils.factory", get_embed_model=lambda: object()),
         "app.utils.config": _module(
             "app.utils.config", chroma_config={"persist_directory": "unused"}
         ),
@@ -238,6 +238,7 @@ def test_related_note_lookup_is_scoped_in_chroma(
         monkeypatch, backend_root / "app/services/note_service.py"
     )
     service = module.NoteService()
+    service.initialize_storage(client=object(), embedding_function=object())
 
     async def get_owned_note(*_: object, **__: object) -> SimpleNamespace:
         return SimpleNamespace(content="same content")

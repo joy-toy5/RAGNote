@@ -48,10 +48,14 @@ async def main() -> int:
     )
     arguments = parser.parse_args()
 
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
+
     from app.evaluation.dataset import load_dataset
     from app.rag.rag_service import RagService
     from app.rag.vector_store import VectorStoreService
-    from app.utils.factory import embed_model
+    from app.utils.factory import get_embed_model
     from scripts.rag008_answer_eval import (
         COLLECTION_NAME,
         DATASET_MANIFEST,
@@ -59,6 +63,7 @@ async def main() -> int:
         _EmptyNoteService,
     )
 
+    embed_model = get_embed_model()
     dataset = load_dataset(DATASET_MANIFEST)
     matched = [q for q in dataset.queries if q.query_id == arguments.query_id]
     if not matched:

@@ -76,7 +76,7 @@ def _load_vector_store_with_fakes(
         "collection_name": "m0-disposable",
         "persist_directory": str(persist_dir),
     }
-    modules["app.utils.factory"].embed_model = object()
+    modules["app.utils.factory"].get_embed_model = lambda: object()
     modules["app.utils.path_tool"].get_abstract_path = lambda _: str(persist_dir)
     modules["app.core.logger_handler"].logger = DummyLogger()
     modules["app.rag.retrievers"].EmptyRetriever = DummyDependency
@@ -193,7 +193,7 @@ def test_sec_003_related_note_vector_query_is_user_scoped(backend_root: Path) ->
         and ast.unparse(call.func) == "asyncio.to_thread"
         and call.args
         and ast.unparse(call.args[0]).endswith(
-            "self._notes_store.similarity_search_with_score"
+            "self.notes_store.similarity_search_with_score"
         )
     ]
     assert len(note_calls) == 1

@@ -7,6 +7,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from app.core.task_registry import background_tasks
 from app.rag.upload_runtime import upload_runtime
+from app.rag.bootstrap import initialize_rag_resources
 from app.db.db_config import check_database_schema
 from app.db.redis_config import connect_redis, close_redis
 from app.router.chat import chat_router
@@ -95,6 +96,8 @@ async def startup_event():
     # 检查并重排序模型
     check_and_download_reranker_model()
     logger.info("重排序模型检查完成")
+    initialize_rag_resources()
+    logger.info("RAG资源初始化完成")
     background_tasks.start()
     upload_runtime.start()
 

@@ -204,6 +204,10 @@ def main() -> int:
         print("dry-run: 未调用 embedding，未写盘")
         return 0
 
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
+
     index_dir = resolve_index_dir(args.index_dir)
     if index_dir.exists():
         if not args.rebuild:
@@ -213,8 +217,9 @@ def main() -> int:
 
     from langchain_chroma import Chroma
 
-    from app.utils.factory import embed_model
+    from app.utils.factory import get_embed_model
 
+    embed_model = get_embed_model()
     store = Chroma(
         collection_name=COLLECTION_NAME,
         embedding_function=embed_model,

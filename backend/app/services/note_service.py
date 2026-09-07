@@ -3,6 +3,7 @@
 """
 import uuid
 import asyncio
+import threading
 import json
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -16,9 +17,6 @@ from langchain_core.messages import HumanMessage
 from app.models.note import Note
 from app.models.review_record import ReviewRecord
 from app.schemas.models import NoteCreate, NoteUpdate, NoteResponse
-from app.utils.factory import embed_model
-from app.utils.config import chroma_config
-from app.utils.path_tool import get_abstract_path
 from app.core.logger_handler import logger
 from app.core.task_registry import background_tasks
 from app.utils.prompt_loader import load_prompt
@@ -50,18 +48,34 @@ class NoteService:
     """
 
     def __init__(self):
-        """
-        初始化 ChromaDB 笔记集合。复用现有 persist_directory 但使用独立 collection。
-        """
-        persist_dir = get_abstract_path(chroma_config['persist_directory'])
-        self._notes_store = Chroma(
-            collection_name=NOTES_COLLECTION_NAME,
-            embedding_function=embed_model,
-            persist_directory=persist_dir,
-        )
+        """只建立内存状态；存储由启动组合根显式绑定。"""
+        self._notes_store = None
+        self._storage_client = None
+        self._storage_embedding = None
+        self._storage_lock = threading.Lock()
+
+    def initialize_storage(self, *, client, embedding_function) -> None:
+        """借用知识库客户端；不创建第二个客户端，也不接管其关闭权。"""
+        if client is None or embedding_function is None:
+            raise ValueError("笔记存储初始化必须提供客户端和嵌入模型")
+        with self._storage_lock:
+            if self._notes_store is not None:
+                if client is not self._storage_client or embedding_function is not self._storage_embedding:
+                    raise RuntimeError("笔记存储已经绑定其他客户端或嵌入模型")
+                return
+            store = Chroma(
+                collection_name=NOTES_COLLECTION_NAME,
+                embedding_function=embedding_function,
+                client=client,
+            )
+            self._storage_client = client
+            self._storage_embedding = embedding_function
+            self._notes_store = store
 
     @property
     def notes_store(self):
+        if self._notes_store is None:
+            raise RuntimeError("笔记存储尚未由启动入口初始化")
         return self._notes_store
 
     def _doc_to_response(self, note: Note) -> NoteResponse:
@@ -109,7 +123,7 @@ class NoteService:
                     "title": payload.title,
                 }
             )
-            await asyncio.to_thread(lambda: self._notes_store.add_documents([doc], ids=[note_id]))
+            await asyncio.to_thread(lambda: self.notes_store.add_documents([doc], ids=[note_id]))
         except Exception as e:
             logger.error(f"笔记向量化失败 note_id={note_id}: {e}")
 
@@ -155,7 +169,7 @@ class NoteService:
             try:
                 # 先删除旧向量，再写入新向量
                 await asyncio.to_thread(
-                    lambda: self._notes_store.delete(where={"note_id": note_id})
+                    lambda: self.notes_store.delete(where={"note_id": note_id})
                 )
                 doc = Document(
                     page_content=note.content,
@@ -166,7 +180,7 @@ class NoteService:
                         "title": note.title,
                     }
                 )
-                await asyncio.to_thread(lambda: self._notes_store.add_documents([doc], ids=[note_id]))
+                await asyncio.to_thread(lambda: self.notes_store.add_documents([doc], ids=[note_id]))
             except Exception as e:
                 logger.error(f"更新笔记向量失败 note_id={note_id}: {e}")
 
@@ -190,7 +204,7 @@ class NoteService:
         # 清理向量
         try:
             await asyncio.to_thread(
-                lambda: self._notes_store.delete(where={"note_id": note_id})
+                lambda: self.notes_store.delete(where={"note_id": note_id})
             )
         except Exception as e:
             logger.error(f"删除笔记向量失败 note_id={note_id}: {e}")
@@ -256,7 +270,7 @@ class NoteService:
         """
         try:
             docs = await asyncio.to_thread(
-                self._notes_store.similarity_search,
+                self.notes_store.similarity_search,
                 query,
                 k=top_k,
                 filter={"user_id": user_id, "doc_type": "note"},
@@ -305,7 +319,7 @@ class NoteService:
         # 从笔记库检索相似笔记（排除自身）
         try:
             note_docs = await asyncio.to_thread(
-                self._notes_store.similarity_search_with_score,
+                self.notes_store.similarity_search_with_score,
                 note.content,
                 k=top_k + 1,  # 多取一个，排除自身
                 filter={"user_id": user_id, "doc_type": "note"},
@@ -388,7 +402,8 @@ class NoteService:
             prompt = prompt_template.replace("{content}", content)
 
             # 惰性导入避免模块级循环依赖
-            from app.utils.factory import chat_model
+            from app.utils.factory import get_chat_model
+            chat_model = get_chat_model()
             from app.db.db_config import AsyncSessionLocal
 
             response = await chat_model.ainvoke([HumanMessage(content=prompt)])
@@ -442,7 +457,8 @@ class NoteService:
             {"completion": "续写文本", "success": true/false}
         """
         try:
-            from app.utils.factory import chat_model
+            from app.utils.factory import get_chat_model
+            chat_model = get_chat_model()
             from langchain_core.messages import HumanMessage
 
             prompt_template = load_prompt("autocomplete_prompt")
@@ -470,7 +486,8 @@ class NoteService:
         Yields:
             SSE 事件数据（字符串）
         """
-        from app.utils.factory import chat_model
+        from app.utils.factory import get_chat_model
+        chat_model = get_chat_model()
         from langchain_core.messages import HumanMessage
 
         prompt_template = load_prompt("write_assistant_prompt")

@@ -184,7 +184,7 @@ def _load_note_service(
         "app.models.review_record": _module(
             "app.models.review_record", ReviewRecord=object
         ),
-        "app.utils.factory": _module("app.utils.factory", embed_model=object()),
+        "app.utils.factory": _module("app.utils.factory", get_embed_model=lambda: object()),
         "app.utils.config": _module(
             "app.utils.config", chroma_config={"persist_directory": "unused"}
         ),
@@ -225,6 +225,7 @@ def test_user_cannot_read_search_or_delete_another_users_note(
         monkeypatch, backend_root / "app/services/note_service.py"
     )
     service = module.NoteService()
+    service.initialize_storage(client=object(), embedding_function=object())
     database = NoteDatabase()
 
     assert asyncio.run(service.get_note(database, NOTE_B, USER_A)) is None
@@ -354,7 +355,7 @@ def _load_vector_store(
                 "persist_directory": "unused",
             },
         ),
-        "app.utils.factory": _module("app.utils.factory", embed_model=object()),
+        "app.utils.factory": _module("app.utils.factory", get_embed_model=lambda: object()),
         "app.utils.path_tool": _module(
             "app.utils.path_tool", get_abstract_path=lambda _: "/tmp/m1-unused"
         ),

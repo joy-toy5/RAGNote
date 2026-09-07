@@ -7,7 +7,7 @@ from langchain_core.documents import Document
 
 from app.rag.text_spliter import AsyncTextSplitter
 from app.utils.config import chroma_config
-from app.utils.factory import embed_model
+from app.utils.factory import get_embed_model
 from app.utils.file_handler import pdf_loader, txt_loader, listdir_allowed_type, get_file_md5_hex, markdown_loader, \
     ppt_loader, word_loader, pdf_loader_sync, txt_loader_sync, markdown_loader_sync, ppt_loader_sync, word_loader_sync
 from app.utils.pdf_multimodal_loader import pdf_multimodal_loader, pdf_multimodal_loader_sync
@@ -24,7 +24,7 @@ class DocumentProcessor:
             chunk_size=chroma_config['chunk_size'],
             chunk_overlap=chroma_config['chunk_overlap'],
             separators=chroma_config['separators'],
-            embedding_model=embed_model
+            embedding_model=get_embed_model()
         )
 
     async def get_file_document(

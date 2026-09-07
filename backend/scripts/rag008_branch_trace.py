@@ -38,11 +38,16 @@ async def main() -> None:
     parser.add_argument("--model", default=None)
     args = parser.parse_args()
 
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
+
     from app.rag.rag_service import RagService
     from app.rag.vector_store import VectorStoreService
-    from app.utils.factory import embed_model
+    from app.utils.factory import get_embed_model
     from scripts.rag008_answer_eval import COLLECTION_NAME, TOP_K, _EmptyNoteService
 
+    embed_model = get_embed_model()
     query = _load_query(args.query_id)
 
     chat_model = None

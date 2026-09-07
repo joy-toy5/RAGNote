@@ -14,9 +14,12 @@ import asyncio
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import pytest
 from langchain_core.documents import Document
 
 from app.rag.rag_service import NO_ROUTE_AGREEMENT_CODE, RagService
+
+pytestmark = pytest.mark.usefixtures("isolated_rag_model")
 
 USER = "gate-user"
 
