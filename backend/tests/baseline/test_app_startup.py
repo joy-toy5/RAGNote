@@ -61,18 +61,33 @@ def _load_isolated_app(
     async def close_redis() -> None:
         events.append("close_redis")
 
+    class Engine:
+        async def dispose(self):
+            events.append("dispose_database")
+
     class TaskRegistry:
         def start(self) -> None:
             events.append("start_tasks")
 
+        def stop_accepting(self):
+            events.append("stop_tasks")
+
+        async def drain(self, *, timeout: float):
+            assert timeout > 0
+            events.append("drain_tasks")
+            return ()
+
         async def cancel_and_wait(self, *, timeout: float):
             assert timeout > 0
-            events.append("stop_tasks")
+            events.append("cancel_tasks")
             return ()
 
     class UploadRuntime:
         def start(self) -> None:
             events.append("start_uploads")
+
+        def stop_accepting(self):
+            events.append("stop_upload_admission")
 
         async def shutdown(self, *, timeout: float):
             assert timeout > 0
@@ -121,6 +136,7 @@ def _load_isolated_app(
         "app.db.db_config": _module(
             "app.db.db_config",
             check_database_schema=check_database_schema,
+            async_engine=Engine(),
         ),
         "app.db.redis_config": _module(
             "app.db.redis_config",
@@ -248,8 +264,11 @@ def test_fastapi_app_assembles_without_real_dependencies(
         "start_tasks",
         "start_uploads",
         "stop_tasks",
+        "stop_upload_admission",
+        "drain_tasks",
         "stop_uploads",
         "close_redis",
+        "dispose_database",
     ]
     assert attempted_dangerous_imports == []
 
@@ -275,3 +294,27 @@ def test_failed_startup_does_not_open_task_or_upload_admission(
     assert "start_uploads" not in events
     if phase == "check_database_schema":
         assert "initialize_rag_resources" not in events
+
+
+def test_shutdown_shares_drain_then_cancels_and_closes_resources(backend_root, monkeypatch):
+    module, events = _load_isolated_app(monkeypatch, backend_root / "main.py")
+    events.clear()
+
+    async def pending_tasks(*, timeout):
+        assert timeout == module.SHUTDOWN_GRACE_SECONDS
+        events.append("drain_tasks")
+        return ("synthetic-pending-task",)
+
+    monkeypatch.setattr(module.background_tasks, "drain", pending_tasks)
+
+    async def scenario():
+        draining = module.begin_shutdown()
+        assert module.begin_shutdown() is draining
+        await module.shutdown_event()
+        assert draining.done()
+
+    asyncio.run(scenario())
+    assert events.count("drain_tasks") == 1
+    assert events[-5:] == [
+        "drain_tasks", "cancel_tasks", "stop_uploads", "close_redis", "dispose_database",
+    ]

@@ -8,7 +8,7 @@ from starlette.middleware.cors import CORSMiddleware
 from app.core.task_registry import background_tasks
 from app.rag.upload_runtime import upload_runtime
 from app.rag.bootstrap import initialize_rag_resources
-from app.db.db_config import check_database_schema
+from app.db.db_config import async_engine, check_database_schema
 from app.db.redis_config import connect_redis, close_redis
 from app.router.chat import chat_router
 from app.router.knowledge_router import knowledge_router
@@ -31,6 +31,9 @@ from app.rag.reorder_service import check_and_download_reranker_model
 load_dotenv()
 
 app = FastAPI()
+SHUTDOWN_GRACE_SECONDS = 5.0
+_shutdown_task = None
+
 
 # 中间件始终装配；开发环境可通过开关在内部放行，生产环境禁止关闭。
 app.add_middleware(RateLimitMiddleware, limit=100, window=60)
@@ -79,6 +82,8 @@ async def say_hello(name: str):
 @app.on_event("startup")
 async def startup_event():
     """应用启动时初始化会话管理器"""
+    global _shutdown_task
+    _shutdown_task = None
     validate_rate_limit_config()
     validate_auth_config()
 
@@ -101,14 +106,33 @@ async def startup_event():
     background_tasks.start()
     upload_runtime.start()
 
+def begin_shutdown():
+    """信号入口只停止新任务并安排收尾，不在信号回调中关闭存储。"""
+    global _shutdown_task
+    background_tasks.stop_accepting()
+    upload_runtime.stop_accepting()
+    if _shutdown_task is None:
+        _shutdown_task = asyncio.create_task(_drain_tasks(), name="application-drain")
+    return _shutdown_task
+
+
+async def _drain_tasks():
+    pending = await background_tasks.drain(timeout=SHUTDOWN_GRACE_SECONDS)
+    if pending:
+        await background_tasks.cancel_and_wait(timeout=1.0)
+    # 停止剩余解析排队，已运行线程仍保留原P0真实执行边界。
+    return await upload_runtime.shutdown(timeout=1.0)
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
-    """进入 teardown 后有界收尾；早期 SIGTERM drain 留给 P3。"""
+    """先等待任务，超时取消，再有界清理连接；不声称能杀死Python线程。"""
     try:
-        await asyncio.gather(
-            background_tasks.cancel_and_wait(timeout=5.0),
-            upload_runtime.shutdown(timeout=5.0),
-        )
+        await asyncio.shield(begin_shutdown())
     finally:
-        await close_redis()
-        logger.info("Redis连接已关闭")
+        try:
+            await asyncio.wait_for(close_redis(), timeout=1.0)
+            logger.info("Redis连接已关闭")
+        finally:
+            await asyncio.wait_for(async_engine.dispose(), timeout=1.0)
+            logger.info("数据库连接池已关闭")
