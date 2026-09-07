@@ -20,8 +20,16 @@ import test_upload_stream_lifecycle as upload_lifecycle
 service_module = upload_lifecycle.service_module
 
 
-def _load_router(monkeypatch, backend_root, service):
+def _load_router(monkeypatch, backend_root, service, *, recorded_uploads=False):
     monkeypatch.setitem(sys.modules, "app.router.knowledge_service", service)
+    if not recorded_uploads:
+        # 原P0用例仍验证响应对低层生成器的拥有权；持久执行另以真实接入层验证。
+        async def submit_upload(knowledge_service, files, user_id):
+            return "p0-upload-test", knowledge_service.handle_add_vector_multiple_stream(files, user_id)
+
+        upload = types.ModuleType("app.tasking.upload")
+        upload.submit_upload = submit_upload
+        monkeypatch.setitem(sys.modules, upload.__name__, upload)
     stubs = {
         "app.utils.auth_utils": {"get_current_user_id": lambda: "test-user"},
         "app.utils.image_extractor": {"get_image_path": lambda *_: None},

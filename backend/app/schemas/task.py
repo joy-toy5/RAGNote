@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from app.tasking.contracts import TaskKind, TaskStatus
 
@@ -42,6 +42,13 @@ class TaskResponse(BaseModel):
     error_code: str | None = None
     error_summary: str | None = None
     retry_of_task_id: str | None = None
+    result_url: str | None = Field(default=None, validation_alias="result_ref")
+
+    @field_validator("result_url", mode="before")
+    @classmethod
+    def known_result_url(cls, value):
+        # 仅公开已有鉴权查询入口，绝不透传任意内部结果引用。
+        return value if value == "/knowledge/list" else None
 
 
 class TaskListResponse(BaseModel):

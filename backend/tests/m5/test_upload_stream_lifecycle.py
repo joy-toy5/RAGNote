@@ -546,6 +546,13 @@ def test_real_fastapi_send_disconnect_has_no_unmanaged_wait_task(
 ):
     module = service_module
     monkeypatch.setitem(sys.modules, "app.router.knowledge_service", module)
+    # 本例保留原P0低层写入/响应拥有权断言；持久接单由demo集成测试单独覆盖。
+    async def submit_upload(service, files, user_id):
+        return "p0-upload-test", service.handle_add_vector_multiple_stream(files, user_id)
+
+    upload = types.ModuleType("app.tasking.upload")
+    upload.submit_upload = submit_upload
+    monkeypatch.setitem(sys.modules, upload.__name__, upload)
     # 路由只保留真实响应装配，鉴权/限流等依赖不得读取本机 .env。
     for name, attributes in {
         "app.utils.auth_utils": {"get_current_user_id": lambda: "u"},

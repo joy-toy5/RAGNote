@@ -146,3 +146,18 @@ def test_externally_cancelled_write_is_quarantined_not_reported_stopped() -> Non
             runtime.acquire()
 
     asyncio.run(scenario())
+
+
+def test_stop_accepting_does_not_interrupt_an_admitted_batch():
+    from app.rag.upload_runtime import UploadBusy, UploadRuntime
+    async def scenario():
+        runtime = UploadRuntime()
+        lease = runtime.acquire()
+        runtime.stop_accepting()
+        with pytest.raises(UploadBusy):
+            runtime.acquire()
+        future = lease.submit(lambda: "completed")
+        assert await asyncio.wrap_future(future) == "completed"
+        lease.close()
+        assert await runtime.shutdown(timeout=1) == 0
+    asyncio.run(scenario())

@@ -44,7 +44,7 @@ TERMINAL_TASK_STATUSES = frozenset(("succeeded", "failed", "superseded", "cancel
 
 @dataclass(frozen=True, slots=True)
 class TaskSubmission:
-    """已完成输入持久化、可在同一数据库事务中登记的任务意图。"""
+    """事务内登记的任务意图；输入能否重放由提交入口明确保证。"""
 
     user_id: str
     kind: TaskKind
