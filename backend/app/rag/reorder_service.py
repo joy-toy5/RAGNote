@@ -120,7 +120,8 @@ class ReorderService:
     def __init__(self):
         self.LOCAL_MODEL_PATH = os.getenv("RERANKER_MODEL_PATH", r"D:\Hugging_Face\models\Qwen3-Reranker-0.6B")
         self.MODELSCOPE_MODEL_NAME = "Qwen/Qwen3-Reranker-0.6B"
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Demo 固定使用 CPU，不随开发机的 CUDA 可用性改变运行设备。
+        self.device = "cpu"
         self._model = None
         self._tokenizer = None
         self._token_true = None

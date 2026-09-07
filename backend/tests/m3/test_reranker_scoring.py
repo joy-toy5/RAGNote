@@ -25,6 +25,7 @@ import gc
 import hashlib
 import os
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -286,4 +287,61 @@ def test_prompt_template_is_pinned_byte_for_byte() -> None:
     ), f"SUFFIX 已变，实际 sha256={digest(module._RERANK_SUFFIX)}"
     assert module._RERANK_SUFFIX.endswith("<think>\n\n</think>\n\n"), (
         "官方模板末尾的空 <think> 块不能省"
+    )
+
+
+@pytest.mark.parametrize("cuda_available", [False, True])
+def test_reranker_keeps_model_and_inputs_on_cpu(
+    monkeypatch: pytest.MonkeyPatch, cuda_available: bool
+) -> None:
+    """即使 CUDA 可用，模型和输入也留在 CPU，并复用 float32 模型缓存。"""
+    from app.rag import reorder_service as module
+
+    monkeypatch.setattr(module.torch.cuda, "is_available", lambda: cuda_available)
+    monkeypatch.setattr(module, "find_model_path", lambda path: path)
+    service = module.ReorderService()
+    assert service.device == "cpu"
+
+    tokenizer = MagicMock()
+    tokenizer.convert_tokens_to_ids.side_effect = {"yes": 1, "no": 0}.__getitem__
+    tokenizer.encode.return_value = [1]
+    tokenizer.return_value = {"input_ids": [[1]]}
+    tensors = {key: MagicMock() for key in ("input_ids", "attention_mask")}
+    for tensor in tensors.values():
+        tensor.to.return_value = module.torch.tensor([[1]], device="cpu")
+    tokenizer.pad.return_value = tensors
+    tokenizer_loader = MagicMock(return_value=tokenizer)
+    monkeypatch.setattr(module.AutoTokenizer, "from_pretrained", tokenizer_loader)
+
+    model = MagicMock()
+    model.return_value.logits = module.torch.zeros((1, 1, 2), device="cpu")
+    model_loader = MagicMock(
+        return_value=(model, {"missing_keys": [], "mismatched_keys": []})
+    )
+    monkeypatch.setattr(module.AutoModelForCausalLM, "from_pretrained", model_loader)
+    selftest = MagicMock()
+    monkeypatch.setattr(service, "_assert_scoring_is_sane", selftest)
+
+    assert asyncio.run(service.model) is model
+    assert asyncio.run(service.model) is model
+    tokenizer_loader.assert_called_once_with(
+        service.LOCAL_MODEL_PATH, padding_side="left", local_files_only=True
+    )
+    model_loader.assert_called_once_with(
+        service.LOCAL_MODEL_PATH,
+        dtype=module.torch.float32,
+        local_files_only=True,
+        output_loading_info=True,
+    )
+    model.eval.assert_called_once_with()
+    model.to.assert_called_once_with("cpu")
+    selftest.assert_called_once_with()
+
+    assert service._score_batch(["离线合成输入"]) == pytest.approx([0.5])
+    for tensor in tensors.values():
+        tensor.to.assert_called_once_with("cpu")
+    model.assert_called_once_with(
+        input_ids=tensors["input_ids"].to.return_value,
+        attention_mask=tensors["attention_mask"].to.return_value,
+        logits_to_keep=1,
     )

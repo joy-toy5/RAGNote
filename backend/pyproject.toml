@@ -35,9 +35,9 @@ dependencies = [
     "sentence-transformers>=5.3.0",
     "modelscope>=1.35.3",
     "accelerate>=1.13.0",
-    "torch>=2.11.0",
-    "torchvision>=0.26.0",
-    "torchaudio>=2.11.0",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "torchaudio==2.11.0",
     "langchain-dashscope>=0.1.8",
     "unstructured[all-docs]>=0.22.20",
     "langsmith>=0.7.22",
@@ -64,5 +64,23 @@ dev = [
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
 
+# 仅 Torch 三件套使用官方 CPU 源，其他依赖保留原镜像源。
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [tool.uv]
 index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+# Linux/Windows 明确选择 CPU 构建；其他平台保留原有来源。
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchaudio = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
