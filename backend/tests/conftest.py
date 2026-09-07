@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +17,17 @@ OFFLINE_ENV = {
     "HF_HUB_OFFLINE": "1",
     "TRANSFORMERS_OFFLINE": "1",
     "LANGSMITH_TRACING": "false",
+    "PYTHON_DOTENV_DISABLED": "1",
 }
 _ORIGINAL_ENV: dict[str, str | None] = {}
 _ORIGINAL_SOCKET: dict[tuple[object, str], Any] = {}
+_ORIGINAL_CHROMA: dict[tuple[object, str], Any] = {}
+_AUDIT_INSTALLED = False
+_OFFLINE_ACTIVE = False
+_PATH_EVENTS = {
+    "open", "os.listdir", "os.scandir", "os.mkdir", "os.remove", "os.rmdir", "os.chdir", "sqlite3.connect",
+}
+_TWO_PATH_EVENTS = {"os.rename", "os.link", "os.symlink"}
 
 
 def _explicit_online_suite(config: pytest.Config) -> bool:
@@ -41,8 +50,38 @@ def _blocked_network(*_: object, **__: object) -> None:
     raise RuntimeError("M0 默认离线测试禁止建立网络连接")
 
 
+def _blocked_chroma(*_: object, **__: object) -> None:
+    raise RuntimeError("默认离线测试禁止构造真实Chroma客户端，请显式注入替身")
+
+
+def _guard_runtime_files(event: str, arguments: tuple[object, ...]) -> None:
+    """审计Python层路径操作；原生存储入口另由构造守卫阻断。"""
+    if not _OFFLINE_ACTIVE or event not in _PATH_EVENTS | _TWO_PATH_EVENTS:
+        return
+    paths = arguments[:2] if event in _TWO_PATH_EVENTS else arguments[:1]
+    for value in paths:
+        if not isinstance(value, (str, bytes, os.PathLike)):
+            continue
+        path = Path(os.path.abspath(os.fsdecode(value)))
+        data_root = BACKEND_ROOT / "data"
+        if path == data_root or data_root in path.parents:
+            raise RuntimeError("默认离线测试禁止访问运行数据目录")
+        if path.name == ".env" and REPOSITORY_ROOT in path.parents:
+            raise RuntimeError("默认离线测试禁止读取项目.env")
+
+
+def _guard_chroma_construction() -> None:
+    from chromadb.api.shared_system_client import SharedSystemClient
+    from langchain_chroma import Chroma
+
+    for owner in (SharedSystemClient, Chroma):
+        _ORIGINAL_CHROMA[(owner, "__init__")] = owner.__init__
+        owner.__init__ = _blocked_chroma
+
+
 def pytest_configure(config: pytest.Config) -> None:
-    """在测试模块收集前阻断常见 Python socket 出口。"""
+    """在collection前保护网络、运行目录、私有环境与真实存储构造。"""
+    global _AUDIT_INSTALLED, _OFFLINE_ACTIVE
     if _explicit_online_suite(config):
         return
 
@@ -62,9 +101,22 @@ def pytest_configure(config: pytest.Config) -> None:
         _ORIGINAL_SOCKET[(owner, name)] = getattr(owner, name)
         setattr(owner, name, _blocked_network)
 
+    _OFFLINE_ACTIVE = True
+    if not _AUDIT_INSTALLED:
+        sys.addaudithook(_guard_runtime_files)
+        _AUDIT_INSTALLED = True
+    _guard_chroma_construction()
+
 
 def pytest_unconfigure(config: pytest.Config) -> None:
     del config
+    global _OFFLINE_ACTIVE
+    # audit hook无法卸载；退出pytest后先失活，再恢复本次替换的构造函数。
+    _OFFLINE_ACTIVE = False
+    for (owner, name), value in _ORIGINAL_CHROMA.items():
+        setattr(owner, name, value)
+    _ORIGINAL_CHROMA.clear()
+
     for (owner, name), value in _ORIGINAL_SOCKET.items():
         setattr(owner, name, value)
     _ORIGINAL_SOCKET.clear()
