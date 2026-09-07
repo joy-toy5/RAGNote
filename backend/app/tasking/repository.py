@@ -266,3 +266,37 @@ async def retry_task(
     )
     task, _ = await create_or_get_task(session, submission)
     return task
+
+
+async def start_local_task(session: AsyncSession, task_id: str, user_id: str) -> bool:
+    """Demo本进程已接单任务开始执行；不领取租约或自动重放。"""
+    task = await _get_task(session, task_id, user_id, lock=True)
+    if task.status != "pending":
+        return False
+    task.status = "processing"
+    task.phase = "processing"
+    task.started_at = _now()
+    await session.flush()
+    return True
+
+
+async def finish_local_task(
+    session: AsyncSession, task_id: str, user_id: str, *, status: str,
+    result_ref: str | None = None, error_code: str | None = None,
+    error_summary: str | None = None,
+) -> None:
+    """复用已有结果/错误字段；调用方负责事务提交与错误脱敏。"""
+    if status not in {"succeeded", "failed"}:
+        raise ValueError("本地执行只结算成功或失败")
+    task = await _get_task(session, task_id, user_id, lock=True)
+    if task.status in TERMINAL_TASK_STATUSES:
+        return
+    task.status = status
+    task.phase = status
+    task.progress = 100 if status == "succeeded" else task.progress
+    task.result_ref = result_ref
+    task.result_version = 1 if result_ref else None
+    task.error_code = error_code
+    task.error_summary = error_summary
+    task.completed_at = _now()
+    await session.flush()

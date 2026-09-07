@@ -51,11 +51,15 @@ async def add_vector_multiple_stream(
         _: None = Depends(rate_limit(limit=3, window=60))
 ):
     """上传多个文件，流式返回处理进度，仅支持TXT、PDF、MD、PPTX、DOCX"""
+    from app.tasking.upload import submit_upload
+
+    task_id, events = await submit_upload(knowledge_service, files, user_id)
     return ClosingStreamingResponse(
-        knowledge_service.handle_add_vector_multiple_stream(files, user_id),
+        events,
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
+            "X-Task-ID": task_id,
             "Connection": "keep-alive",
         }
     )

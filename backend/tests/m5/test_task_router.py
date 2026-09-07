@@ -27,7 +27,7 @@ NOW = datetime(2026, 9, 5, 8, 0, tzinfo=timezone.utc)
 PUBLIC_FIELDS = {
     "task_id", "kind", "status", "resource_id", "target_generation", "progress",
     "created_at", "updated_at", "started_at", "completed_at", "next_run_at",
-    "cancel_requested_at", "error_code", "error_summary", "retry_of_task_id",
+    "cancel_requested_at", "error_code", "error_summary", "retry_of_task_id", "result_url",
 }
 OPERATIONS = [
     ("GET", "/tasks", "list_tasks"),
@@ -113,6 +113,7 @@ def _payload(path):
 
 def _assert_public(data):
     assert set(data) == PUBLIC_FIELDS
+    assert data["result_url"] is None  # 内部结果引用不能成为公开URL。
     assert data["kind"] == "note.index"
     assert data["resource_id"] == "33333333-3333-4333-8333-333333333333"
     assert data["target_generation"] == 2

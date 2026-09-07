@@ -254,6 +254,8 @@ class KnowledgeService:
         返回 (有效文件列表, SSE错误事件列表, 总文件数)
         """
         total_files = len(files)
+        if total_files > MAX_UPLOAD_FILES:
+            raise HTTPException(status_code=400, detail=f"单批上传不能超过{MAX_UPLOAD_FILES}个文件")
         total_size = 0
         files_content = []
         error_events: List[str] = []
@@ -393,20 +395,22 @@ class KnowledgeService:
                 lease.queue.task_done()
 
     async def handle_add_vector_multiple_stream(
-        self, files: List[UploadFile], user_id: str,
+        self, files: List[UploadFile], user_id: str, *, prepared=None, lease=None,
     ) -> AsyncGenerator[str, None]:
-        """流式上传的进程内容量/取消边界；不是持久接单接口。"""
-        total_files = len(files)
+        """保留低层上传流程；持久入口可传入独立输入与已占用的容量。"""
+        total_files = len(files) if prepared is None else prepared[2]
         start_time = time.time()
-        lease = None
         results = None
         yield self._yield_start_event(total_files)
         try:
             if total_files > MAX_UPLOAD_FILES:
                 raise ValueError(f"单批上传不能超过{MAX_UPLOAD_FILES}个文件")
             # 先占容量，再将 UploadFile 读成 bytes，拒绝请求不排无限长队。
-            lease = upload_runtime.acquire()
-            valid_files, error_events, _ = await self._validate_and_read_files(files)
+            if lease is None:
+                lease = upload_runtime.acquire()
+            valid_files, error_events, _ = (
+                await self._validate_and_read_files(files) if prepared is None else prepared
+            )
             for event in error_events:
                 yield event
             if not valid_files:

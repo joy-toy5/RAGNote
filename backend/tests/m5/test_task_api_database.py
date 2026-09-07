@@ -32,6 +32,7 @@ PUBLIC_FIELDS = {
     "task_id", "kind", "status", "resource_id", "target_generation", "progress",
     "created_at", "updated_at", "started_at", "completed_at", "next_run_at",
     "cancel_requested_at", "error_code", "error_summary", "retry_of_task_id",
+    "result_url",
 }
 
 
