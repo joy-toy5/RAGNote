@@ -72,8 +72,9 @@ def _build_service(query: object, index_dir: Path) -> object:
     """
     from app.rag.rag_service import RagService
     from app.rag.vector_store import VectorStoreService
-    from app.utils.factory import embed_model
+    from app.utils.factory import get_embed_model
 
+    embed_model = get_embed_model()
     store = VectorStoreService.for_explicit_target(
         persist_directory=str(index_dir),
         collection_name=COLLECTION_NAME,
@@ -223,6 +224,10 @@ async def main() -> int:
     )
     arguments = parser.parse_args()
 
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
+
     from app.evaluation.dataset import load_dataset
 
     index_dir = Path(arguments.index_dir).resolve()
@@ -237,11 +242,11 @@ async def main() -> int:
         raise SystemExit(f"数据集里没有这些 query_id：{missing} —— 不猜。")
     queries = [by_id[qid] for qid in wanted]
 
-    # 必须先 import 工厂再读环境变量：`.env` 是工厂 import 时才载入的，早读会得到
-    # None 并打出一个假的模型名（初版就是这个缺陷）。模型名直接问客户端本人，
+    # 显式取得实际客户端再读模型名，不依赖工厂导入时的副作用。
     # 不问环境变量 —— 「配置里写着的」不等于「客户端真用的」，那正是 `RAG-019`。
-    from app.utils.factory import chat_model as _production_chat_model
+    from app.utils.factory import get_chat_model
 
+    _production_chat_model = get_chat_model()
     actual_model = getattr(_production_chat_model, "model_name", None) or getattr(
         _production_chat_model, "model", "<读不到>"
     )

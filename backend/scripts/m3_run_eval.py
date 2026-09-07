@@ -81,8 +81,9 @@ class _RetrievalOnlyRagService:
     ) -> None:
         from app.rag.rag_service import RagService
         from app.rag.vector_store import VectorStoreService
-        from app.utils.factory import embed_model
+        from app.utils.factory import get_embed_model
 
+        embed_model = get_embed_model()
         self._descriptor = descriptor
         self._vector_store = VectorStoreService.for_explicit_target(
             persist_directory=index_dir,
@@ -363,6 +364,10 @@ def source_revision(repo_root: Path) -> str:
 
 
 async def run(arguments: argparse.Namespace) -> int:
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
+
     dataset = load_dataset(arguments.dataset)
     manifest = json.loads(Path(arguments.dataset).read_text(encoding="utf-8"))
     if manifest["index_version"] != dataset.index_version:

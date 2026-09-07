@@ -6,7 +6,7 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
 from app.utils.config import chroma_config
-from app.utils.factory import embed_model
+from app.utils.factory import get_embed_model
 from app.utils.path_tool import get_abstract_path
 from app.core.logger_handler import logger
 
@@ -14,20 +14,6 @@ from .retrievers.hybrid_retriever import HybridRetriever
 from .md5_manager import MD5Store
 from .document_handler import DocumentProcessor
 from app.utils.image_extractor import delete_image_directory, delete_user_all_images
-
-
-def _clear_chroma_cache():
-    """
-    清除 ChromaDB SharedSystemClient 内部单例缓存，避免 KeyError。
-    ChromaDB 在 0.5.x+ 引入了 SharedSystemClient，它内部维护了一个全局 _instance 字典。
-    当同一个进程反复创建/删除 Chroma 实例时，会抛出 KeyError（因为缓存中的 client 已被销毁）。
-    在初始化前主动清除缓存，可以避免此问题。
-    """
-    try:
-        from chromadb.api.shared_system_client import SharedSystemClient
-        SharedSystemClient.clear_system_cache()
-    except Exception:
-        pass
 
 
 class VectorStoreService:
@@ -40,6 +26,7 @@ class VectorStoreService:
     """
     _instance = None
     _initialized = False
+    _initialization_failed = False
     _init_lock = threading.Lock()
 
     def __new__(cls):
@@ -58,14 +45,16 @@ class VectorStoreService:
         with VectorStoreService._init_lock:
             if VectorStoreService._initialized:
                 return
+            if VectorStoreService._initialization_failed:
+                raise RuntimeError("向量库初始化曾失败，必须重启进程后重试")
 
             persist_dir = get_abstract_path(chroma_config['persist_directory'])
-            # 在创建 Chroma 实例前清除缓存，避免残留的单例 client 导致 KeyError
-            _clear_chroma_cache()
 
             try:
                 self._init_chroma(persist_dir)
-            except Exception as e:
+            except BaseException as e:
+                # 部分构造可能已经启动底层系统；无停止证明时不在本进程重建。
+                VectorStoreService._initialization_failed = True
                 logger.exception(
                     "Chroma 初始化失败，持久化目录保持不变；"
                     f"请检查权限、文件锁或数据完整性: {e}"
@@ -77,7 +66,7 @@ class VectorStoreService:
     def _init_chroma(self, persist_dir: str):
         self.vectors_store = Chroma(
             collection_name=chroma_config['collection_name'],
-            embedding_function=embed_model,
+            embedding_function=get_embed_model(),
             persist_directory=persist_dir,
         )
         self.md5_store = MD5Store()
@@ -99,7 +88,7 @@ class VectorStoreService:
 
         与单例路径的区别，以及为什么必须有这个区别：
         - 不写 cls._instance / cls._initialized，因此不污染生产单例；
-        - 不调用 _clear_chroma_cache()，因为清空 SharedSystemClient 缓存会影响
+        - 不清空 SharedSystemClient 缓存，避免影响
           同进程内其他仍然存活的 client；
         - 不构造 MD5Store / DocumentProcessor，所以任何误用的写入/摄取路径会
           直接 AttributeError 失败，而不是静默写进评测索引；
@@ -554,6 +543,9 @@ class VectorStoreService:
 
 
 if __name__ == '__main__':
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
     async def main():
         store = VectorStoreService()
         await store.get_document()

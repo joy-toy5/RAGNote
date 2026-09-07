@@ -1,9 +1,9 @@
 from abc import ABC, abstractmethod
 import math
 from numbers import Real
+from threading import Lock
 from typing import Optional, List
 import os
-from dotenv import load_dotenv
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
@@ -11,9 +11,6 @@ from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_openai import ChatOpenAI
 
 from app.core.logger_handler import logger
-
-# 加载环境变量
-load_dotenv()
 
 # 阿里云百炼的 OpenAI 兼容端点。`ALIYUN_BASE_URL` 未设置时兜到这里，绝不能让
 # ChatOpenAI 用它自己的默认值——那会打 api.openai.com，是比原缺陷更隐蔽的错误。
@@ -326,7 +323,38 @@ class RerankerModelFactory(BaseModelFactory):
         return None
 
 
-chat_model = ChatModelFactory().generator()
-embed_model = EmbedModelFactory().generator()
+# 配置由应用入口加载；各模型只在显式调用 getter 时构造并缓存。
+_chat_model: Optional[Embeddings | BaseChatModel] = None
+_embed_model: Optional[Embeddings | BaseChatModel] = None
+_vision_model: Optional[BaseChatModel] = None
+_chat_model_lock = Lock()
+_embed_model_lock = Lock()
+_vision_model_lock = Lock()
 reranker_model = None
-vision_model = VisionModelFactory().generator()
+
+
+def get_chat_model() -> Optional[Embeddings | BaseChatModel]:
+    """按调用时配置创建聊天模型；只缓存成功结果，失败可重试。"""
+    global _chat_model
+    with _chat_model_lock:
+        if _chat_model is None:
+            _chat_model = ChatModelFactory().generator()
+        return _chat_model
+
+
+def get_embed_model() -> Optional[Embeddings | BaseChatModel]:
+    """按调用时配置创建嵌入模型，保留工厂提供的验证包装。"""
+    global _embed_model
+    with _embed_model_lock:
+        if _embed_model is None:
+            _embed_model = EmbedModelFactory().generator()
+        return _embed_model
+
+
+def get_vision_model() -> Optional[BaseChatModel]:
+    """按调用时配置创建视觉模型，与聊天模型独立缓存。"""
+    global _vision_model
+    with _vision_model_lock:
+        if _vision_model is None:
+            _vision_model = VisionModelFactory().generator()
+        return _vision_model

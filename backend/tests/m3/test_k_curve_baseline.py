@@ -147,6 +147,7 @@ def test_max_documents_rejects_invalid_values() -> None:
             RagService(user_id="u", max_documents=bad)
 
 
+@pytest.mark.usefixtures("isolated_rag_model")
 def test_llm_call_timeout_rejects_invalid_values() -> None:
     """超时同样是评测要扫的参数（`RAG-024`），非法值当场炸。
 
@@ -164,7 +165,11 @@ def test_llm_call_timeout_rejects_invalid_values() -> None:
             RagService(user_id="u", llm_call_timeout_s=bad)
 
     # 合法取值（含 int）必须放过，并归一化成 float。
-    assert RagService(user_id="u", llm_call_timeout_s=45).llm_call_timeout_s == 45.0
+    service = RagService(
+        user_id="u", llm_call_timeout_s=45,
+        vector_store=object(), note_service_override=object(),
+    )
+    assert service.llm_call_timeout_s == 45.0
 
 
 def test_both_llm_timeouts_come_from_the_same_parameter() -> None:

@@ -312,10 +312,15 @@ def score(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 async def run(arguments: argparse.Namespace) -> int:
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
+
     from app.evaluation.dataset import load_dataset
     from app.rag.vector_store import VectorStoreService
-    from app.utils.factory import embed_model
+    from app.utils.factory import get_embed_model
 
+    embed_model = get_embed_model()
     index_dir = Path(arguments.index_dir).resolve()
     if not (index_dir / "chroma.sqlite3").exists():
         raise SystemExit(f"{index_dir} 不像是已构建的 Chroma 索引")

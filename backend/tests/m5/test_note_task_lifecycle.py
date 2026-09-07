@@ -240,7 +240,7 @@ def harness(monkeypatch: pytest.MonkeyPatch, backend_root: Path) -> SimpleNamesp
         monkeypatch.setitem(sys.modules, name, package)
     modules = {
         "app.core.task_registry": registry_module,
-        "app.utils.factory": _module("app.utils.factory", chat_model=model),
+        "app.utils.factory": _module("app.utils.factory", get_chat_model=lambda: model),
         "app.db.db_config": _module("app.db.db_config", AsyncSessionLocal=sessions),
     }
     for name, module in modules.items():

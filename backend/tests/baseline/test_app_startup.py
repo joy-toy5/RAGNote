@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import builtins
 import importlib.util
 import logging
@@ -81,6 +82,9 @@ def _load_isolated_app(
     def check_reranker() -> None:
         events.append("check_reranker")
 
+    def initialize_rag_resources() -> None:
+        events.append("initialize_rag_resources")
+
     def register_handlers(_: object) -> None:
         events.append("register_handlers")
 
@@ -141,6 +145,9 @@ def _load_isolated_app(
             "app.utils.auth_utils",
             get_cors_origins=lambda: ["http://localhost:5173"],
             validate_auth_config=validate_auth_config,
+        ),
+        "app.rag.bootstrap": _module(
+            "app.rag.bootstrap", initialize_rag_resources=initialize_rag_resources,
         ),
         "app.rag.reorder_service": _module(
             "app.rag.reorder_service",
@@ -223,6 +230,7 @@ def test_fastapi_app_assembles_without_real_dependencies(
             "init_sessions",
             "connect_redis",
             "check_reranker",
+            "initialize_rag_resources",
             "start_tasks",
             "start_uploads",
         ]
@@ -236,6 +244,7 @@ def test_fastapi_app_assembles_without_real_dependencies(
         "init_sessions",
         "connect_redis",
         "check_reranker",
+        "initialize_rag_resources",
         "start_tasks",
         "start_uploads",
         "stop_tasks",
@@ -243,3 +252,26 @@ def test_fastapi_app_assembles_without_real_dependencies(
         "close_redis",
     ]
     assert attempted_dangerous_imports == []
+
+
+@pytest.mark.baseline
+@pytest.mark.parametrize("phase", ["check_database_schema", "initialize_rag_resources"])
+def test_failed_startup_does_not_open_task_or_upload_admission(
+    backend_root: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    module, events = _load_isolated_app(monkeypatch, backend_root / "main.py")
+
+    def fail() -> None:
+        events.append("failed")
+        raise RuntimeError("合成启动失败")
+
+    async def fail_async() -> None:
+        fail()
+
+    monkeypatch.setattr(module, phase, fail_async if phase == "check_database_schema" else fail)
+    with pytest.raises(RuntimeError, match="合成启动失败"):
+        asyncio.run(module.startup_event())
+    assert "start_tasks" not in events
+    assert "start_uploads" not in events
+    if phase == "check_database_schema":
+        assert "initialize_rag_resources" not in events

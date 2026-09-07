@@ -402,6 +402,7 @@ def _install_offline_guards() -> None:
 
 
 def _load_rag_module() -> types.ModuleType:
+    chat_model = FakeChatModel()
     modules = {
         "app": _package("app"),
         "app.indexing": _package("app.indexing"),
@@ -415,7 +416,7 @@ def _load_rag_module() -> types.ModuleType:
         "app.rag.reorder_service": _module(
             "app.rag.reorder_service", reorder_service=FakeReorderService()
         ),
-        "app.utils.factory": _module("app.utils.factory", chat_model=FakeChatModel()),
+        "app.utils.factory": _module("app.utils.factory", get_chat_model=lambda: chat_model),
         "app.utils.prompt_loader": _module(
             "app.utils.prompt_loader", load_prompt=lambda **_: "summary prompt"
         ),

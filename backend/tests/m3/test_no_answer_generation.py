@@ -30,6 +30,8 @@ from app.rag.rag_service import (
     RagService,
 )
 
+pytestmark = pytest.mark.usefixtures("isolated_rag_model")
+
 USER = "gen-user"
 REFUSAL_TEXT = "抱歉，我在你的资料里没有找到能回答这个问题的内容。"
 
