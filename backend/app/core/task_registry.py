@@ -19,6 +19,23 @@ class TaskRegistry:
         self._accepting = True
 
     @property
+    def accepting(self) -> bool:
+        return self._accepting
+
+    def stop_accepting(self) -> None:
+        """停止新任务，不取消当前执行。"""
+        self._accepting = False
+
+    async def drain(self, *, timeout: float = 5.0) -> frozenset[asyncio.Task[Any]]:
+        """先给当前任务自然完成的时间；超时仍由登记器持有。"""
+        self.stop_accepting()
+        tasks = self.tasks
+        if not tasks:
+            return frozenset()
+        _, pending = await asyncio.wait(tasks, timeout=timeout)
+        return frozenset(pending)
+
+    @property
     def tasks(self) -> frozenset[asyncio.Task[Any]]:
         """返回尚未结束任务的不可变快照，不暴露内部登记集合。"""
         return frozenset(task for task in self._tasks if not task.done())
@@ -49,7 +66,7 @@ class TaskRegistry:
         self, *, timeout: float = 5.0
     ) -> frozenset[asyncio.Task[Any]]:
         """先停止接单，再在共享时限内等待取消；超时任务继续保留登记。"""
-        self._accepting = False
+        self.stop_accepting()
         tasks = self.tasks
         if not tasks:
             return frozenset()

@@ -85,6 +85,7 @@ class UploadRuntime:
         self._leases: set[UploadLease] = set()
         self._lock = threading.RLock()
         self._closing = False
+        self._accepting = True
 
     @property
     def active_count(self) -> int:
@@ -96,10 +97,16 @@ class UploadRuntime:
             if self._leases:
                 raise RuntimeError("旧上传执行未结束，不能重开执行器")
             self._closing = False
+            self._accepting = True
+
+    def stop_accepting(self) -> None:
+        """仅停止新批次；已接受批次仍可完成解析/写入。"""
+        with self._lock:
+            self._accepting = False
 
     def acquire(self) -> UploadLease:
         with self._lock:
-            if self._closing or len(self._leases) >= self._max_uploads:
+            if not self._accepting or self._closing or len(self._leases) >= self._max_uploads:
                 raise UploadBusy("上传处理容量已满或正在关闭，请稍后重试")
             lease = UploadLease(self)
             self._leases.add(lease)
@@ -114,6 +121,7 @@ class UploadRuntime:
 
     async def shutdown(self, *, timeout: float = 5.0) -> int:
         with self._lock:
+            self._accepting = False
             self._closing = True
             for lease in tuple(self._leases):
                 lease.close()

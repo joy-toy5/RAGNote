@@ -450,3 +450,44 @@ def test_cancel_task_accepts_already_finished_tasks(outcome: str) -> None:
         assert registry.tasks == frozenset()
 
     asyncio.run(scenario())
+
+
+def test_graceful_drain_waits_without_cancelling():
+    async def scenario():
+        registry = TaskRegistry()
+        finished = []
+        async def work():
+            await asyncio.sleep(0.01)
+            finished.append(True)
+        task = registry.create(work(), name="demo-drain")
+        assert await registry.drain(timeout=1) == frozenset()
+        assert finished == [True] and not task.cancelled()
+        assert not registry.accepting
+    asyncio.run(scenario())
+
+
+def test_graceful_timeout_keeps_running_task_registered():
+    async def scenario():
+        registry = TaskRegistry()
+        release = asyncio.Event()
+        task = registry.create(release.wait(), name="demo-pending")
+        assert await registry.drain(timeout=0) == frozenset({task})
+        assert task in registry.tasks and not task.cancelled()
+        release.set()
+        assert await registry.drain(timeout=1) == frozenset()
+    asyncio.run(scenario())
+
+
+def test_stop_accepting_is_synchronous_and_preserves_existing_work():
+    async def scenario():
+        registry = TaskRegistry()
+        release = asyncio.Event()
+        task = registry.create(release.wait(), name="existing")
+        registry.stop_accepting()
+        coroutine = release.wait()
+        with pytest.raises(RuntimeError, match="停止接单"):
+            registry.create(coroutine, name="rejected")
+        assert coroutine.cr_frame is None and not task.cancelled()
+        release.set()
+        await task
+    asyncio.run(scenario())
