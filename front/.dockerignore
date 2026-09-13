@@ -1,0 +1,10 @@
+node_modules/
+
+dist/
+
+# 密钥不入镜像，仅保留配置示例。
+.env
+.env.*
+!.env.example
+*.md
+.git/

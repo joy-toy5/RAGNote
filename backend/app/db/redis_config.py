@@ -1,11 +1,17 @@
 import json
+import os
 from typing import Any
 
 import redis.asyncio as redis
 
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-REDIS_DB = 3
+# 从环境变量读取,默认值保持原有字面量 —— 宿主机裸跑的行为不变。
+# 改动原因:容器内 localhost 指向容器自身,连不上独立的 redis 服务;
+# 而 .env 里本就有 REDIS_HOST/REDIS_PORT/REDIS_DB 三个键,此前从未被读取。
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+# 注意默认值是 3,不是 .env.example 里写的 0 —— 与原代码保持一致,
+# 避免改动连带切换了缓存所在的逻辑库。
+REDIS_DB = int(os.getenv("REDIS_DB", "3"))
 
 # 全局redis客户端对象
 redis_client = None

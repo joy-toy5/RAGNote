@@ -11,6 +11,7 @@ AI 驱动的个人知识管理工具，融合 **笔记管理 + RAG 知识库 + A
 - [项目架构](#项目架构)
 - [项目演示](#项目演示)
 - [快速开始](#快速开始)
+- [容器化部署](#容器化部署)
 - [技术栈](#技术栈)
 - [项目结构](#项目结构)
 - [API 文档](#api文档)
@@ -147,75 +148,24 @@ SECRET_KEY=YOUR_SHARED_JWT_SECRET_KEY
 ALGORITHM=HS256
 ```
 
-#### FastAPI 数据库迁移边界
+#### 环境配置
 
-FastAPI 启动时只校验 schema 与 Alembic revision，不会自动建表或执行迁移。仅对隔离的空 `_test` 数据库，在审查迁移文件、确认连接目标并完成可恢复备份后，才可执行：
+参考 [后端环境示例](backend/.env.example) 和 [用户服务环境示例](DjangoUserService/.env.example)，在各自目录创建 `.env` 并填写配置。
 
-```bash
-cd backend
-MYSQL_DATABASE=chat_history_test \
-RAG_MIGRATION_TARGET=chat_history_test \
-uv run alembic upgrade head
-```
+后端 `SECRET_KEY` 与用户服务 `JWT_SECRET_KEY` 必须一致，并与 `DJANGO_SECRET_KEY` 不同。
 
-既有无版本数据库不能直接执行 `upgrade`：代码门禁要求先只读核对 legacy 四表，在隔离副本验证 `0001_legacy` 基线与 `0002_index_contract`，再由操作者明确授权 `stamp`/`upgrade`。非 `_test` 目标和 `downgrade` 还需要独立确认变量；当前真实 MySQL 尚未执行该流程，因此应用对未达到 `0002_index_contract` 的数据库 fail-fast 是预期行为。
+#### 首次初始化数据库
 
-#### 创建用户服务环境变量文件
-
-在 `DjangoUserService` 目录下创建 `.env` 文件：
-
-```env
-# 本地开发配置；生产环境的完整变量见 .env.example
-DJANGO_ENV=development
-DJANGO_SECRET_KEY=YOUR_DJANGO_SIGNING_SECRET_KEY
-# 必须与 FastAPI 的 SECRET_KEY 一致，并与 DJANGO_SECRET_KEY 不同
-JWT_SECRET_KEY=YOUR_SHARED_JWT_SECRET_KEY
-
-# 数据库配置
-DB_PORT=3306
-DB_NAME=user_service
-DB_USER=root
-DB_PASSWORD=root
-DB_HOST=localhost
-
-# Celery 配置
-CELERY_BROKER_URL=redis://localhost:6379/0
-CELERY_RESULT_BACKEND=redis://localhost:6379/0
-CELERY_TASK_TIME_LIMIT=300
-CELERY_TASK_SOFT_TIME_LIMIT=250
-CELERY_RESULT_EXPIRES=3600
-
-# Redis 配置
-REDIS_CACHE_URL=redis://localhost:6379/1
-```
-
-当前 Django `0001_initial` 已完成迁移图和 ORM state 静态对账，但尚未在真实 MySQL 演练。仅对隔离的空 `_test` 数据库，在确认连接目标和备份后可执行：
+源码部署需先创建两个独立的空 MySQL 数据库，并在各自的 `.env` 中配置连接。下面以后端库 `chat_history_test` 为例，请将后端 `.env` 中的 `MYSQL_DATABASE` 设为同名；命令从仓库根目录执行：
 
 ```bash
-DJANGO_ENV=development python manage.py check
-DJANGO_ENV=development python manage.py showmigrations
-DJANGO_ENV=development python manage.py migrate
+(cd backend && \
+  MYSQL_DATABASE=chat_history_test RAG_MIGRATION_TARGET=chat_history_test \
+  uv run alembic upgrade head)
+(cd DjangoUserService && DJANGO_ENV=development uv run python manage.py migrate)
 ```
 
-既有数据库必须先只读核对实际 schema 与 `django_migrations` 台账；禁止直接执行 `makemigrations` 或 `migrate` 覆盖当前基线。
-
-### 向量数据库配置
-
-修改 `backend/app/config/chroma.yaml` 文件：
-
-```yaml
-collection_name: rag_collection
-persist_directory: data/chromadb
-k: 3
-
-data_path: data
-md5_hex_store: data/md5_hex_store/md5_hex_store.txt
-allow_knowledge_file_types: ["txt", "pdf", "md", "pptx", "docx"]
-
-chunk_size: 200
-chunk_overlap: 20
-separators: ["\n\n", "\n", "。", "！", "？", "!", "?", " ", ""]
-```
+以上步骤仅用于新建空库。使用 [容器化部署](#容器化部署) 时，数据库初始化由迁移任务自动完成。
 
 ### 启动服务
 
@@ -228,6 +178,60 @@ separators: ["\n\n", "\n", "。", "！", "？", "!", "?", " ", ""]
 | Redis | `redis-server` 或 `net start redis` | 6379 |
 | Ollama | `ollama serve` | 11434 |
 
+## 容器化部署
+
+### 前置条件
+
+- Docker Engine 24+、Docker Compose v2
+- 内存 ≥ 6 GB、磁盘 ≥ 15 GB
+- 宿主准备好重排序模型（约 1.2 GB）
+
+### 快速启动
+
+**1. 准备模型**
+
+参考 [模型准备说明](docs/modelscope_model.md) 下载 Qwen3-Reranker-0.6B，修改 `docker-compose.yml` 中的挂载路径为实际位置：
+
+```yaml
+- /your/path/to/Qwen3-Reranker-0.6B:/models/Qwen3-Reranker-0.6B:ro
+```
+
+**2. 配置环境变量**
+
+```bash
+cp -n .env.compose.example .env
+cp -n deploy/backend.env.example backend/.env
+cp -n deploy/userservice.env.example DjangoUserService/.env
+```
+
+修改以下必填项：
+
+- ALIYUN_ACCESS_KEY_SECRET — 百炼 API Key
+- SECRET_KEY（backend/.env）与 JWT_SECRET_KEY（DjangoUserService/.env）— 必须完全相同
+- DJANGO_SECRET_KEY（DjangoUserService/.env）— 必须与上面两个不同
+- MYSQL_ROOT_PASSWORD（根目录 .env）— 替换占位值
+
+生成密钥：python3 -c "import secrets; print(secrets.token_urlsafe(64))"
+
+**3. 启动服务**
+```bash
+docker compose build
+docker compose up -d
+python3 deploy/check.py  # 可选：验收脚本
+```
+访问 http://localhost:8080
+
+常用操作
+```bash
+docker compose logs -f backend        # 查看日志
+docker compose restart backend        # 重启服务
+docker compose down                   # 停止（保留数据）
+```
+修改代码后需重新构建：
+```bash
+docker compose build backend && docker compose up -d backend  # 后端
+docker compose build nginx && docker compose up -d nginx      # 前端
+``````
 ## 技术栈
 
 ### 后端技术

@@ -1,0 +1,20 @@
+.venv/
+
+*.egg-info/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 上传文件由卷挂载，不打入镜像。
+media/
+*.log
+logs.log
+
+# 密钥不入镜像，仅保留配置示例。
+.env
+.env.*
+!.env.example
+
+*.md
+.git/

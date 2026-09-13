@@ -1,0 +1,23 @@
+.venv/
+
+# 运行数据与日志不打入镜像。
+data/
+logs/
+
+evals/
+
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 密钥不入镜像，仅保留配置示例。
+.env
+.env.*
+!.env.example
+
+*.md
+.git/
+.gitignore

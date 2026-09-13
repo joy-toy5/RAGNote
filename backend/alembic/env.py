@@ -108,6 +108,20 @@ async def run_async_migrations() -> None:
 
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
+        # 显式提交本函数自己持有的连接。
+        #
+        # 必要性:validate_migration_command 里的 inspect(connection) 是只读操作,
+        # 但会隐式开启事务。于是 context.configure 读到连接已在事务中,
+        # 把 _in_external_transaction 置真,begin_transaction() 退化为 nullcontext
+        # —— alembic 认定事务由调用方管理,不再负责提交。
+        #
+        # MySQL 的隐式 DDL 提交会把这个问题伪装成成功:各 CREATE TABLE 自行落盘,
+        # 但最后那句 UPDATE alembic_version 之后没有 DDL,连接关闭时被回滚,
+        # 留下「表齐全、版本号停在上一级」的不一致状态,退出码却是 0。
+        #
+        # 只修这条 CLI 路径:测试经 config.attributes["connection"] 注入连接,
+        # 走 run_migrations_online 的另一分支,由 engine.begin() 负责提交,不受影响。
+        await connection.commit()
     await connectable.dispose()
 
 

@@ -1,0 +1,294 @@
+# 单机开发部署；应用依赖各自的迁移任务成功退出。
+services:
+
+  mysql:
+    image: mysql:8.0
+    container_name: ragnote-mysql
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      # root 仅用于运维和健康检查，应用使用独立账号。
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-buffer-pool-size=256M
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./deploy/mysql-init:/docker-entrypoint-initdb.d:ro
+    # 仅供本机调试；服务间使用容器网络。
+    ports:
+      - "127.0.0.1:13306:3306"
+    # 同时确认 TCP 服务与两个应用数据库就绪。
+    healthcheck:
+      test: ["CMD", "mysql", "--protocol=TCP", "-h127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD}", "-e", "USE chat_history; USE user_service; SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks:
+      - ragnote
+
+  redis:
+    image: redis:7-alpine
+    container_name: ragnote-redis
+    restart: unless-stopped
+    mem_limit: 192m
+    # 使用 AOF 保留队列，不启用会淘汰排队任务的缓存策略。
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - ragnote
+
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ragnote-backend:dev
+    container_name: ragnote-migrate
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: rag
+      # Demo 密码须与初始化 SQL 一致，实际部署请替换。
+      MYSQL_PASSWORD: rag_app_password
+      MYSQL_DATABASE: chat_history
+
+      # 目标需与 MYSQL_DATABASE 一致；非测试库须显式确认。
+      RAG_MIGRATION_TARGET: chat_history
+      RAG_ALLOW_NON_TEST_MIGRATIONS: I_UNDERSTAND_THIS_MODIFIES_NON_TEST_DATA
+
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - ragnote
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ragnote-backend:dev
+    container_name: ragnote-backend
+    restart: unless-stopped
+    # 停止宽限需大于应用退出上限。
+    stop_grace_period: 15s
+    mem_limit: 4g
+
+    # 运行时注入密钥；下方 environment 优先于 env_file。
+    env_file:
+      - ./backend/.env
+
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: rag
+      MYSQL_PASSWORD: rag_app_password
+      MYSQL_DATABASE: chat_history
+
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "3"
+
+      # 当前服务间使用 HTTP，仅适用于 development。
+      ENV: development
+      RATE_LIMIT_ENABLED: "false"
+      DJANGO_API_URL: http://userservice:8001
+      CORS_ALLOWED_ORIGINS: http://localhost:8080,http://127.0.0.1:8080,http://localhost:5173
+
+      RERANKER_MODEL_PATH: /models/Qwen3-Reranker-0.6B
+
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+
+      PYTHONUNBUFFERED: "1"
+
+    # 模型只读挂载，索引和上传数据使用持久卷。
+    volumes:
+      - /models/Qwen3-Reranker-0.6B:/models/Qwen3-Reranker-0.6B:ro
+      - chroma_data:/app/data/chromadb
+      - blob_data:/app/data/blobs
+      - md5_data:/app/data/md5_hex_store
+      - images_data:/app/data/extracted_images
+
+    # 就绪检查包含 MySQL 与 Redis 连通性。
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/ready',timeout=5).status==200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - ragnote
+
+  usermigrate:
+    build:
+      context: ./DjangoUserService
+      dockerfile: Dockerfile
+    image: ragnote-userservice:dev
+    container_name: ragnote-usermigrate
+    restart: "no"
+    command: ["python", "manage.py", "migrate", "--no-input"]
+    env_file:
+      - ./DjangoUserService/.env
+    environment:
+      # 显式选择开发环境，并禁用容器内 dotenv 文件查找。
+      DJANGO_ENV: development
+      DJANGO_LOAD_DOTENV: "false"
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: user_service
+      DB_USER: rag
+      DB_PASSWORD: rag_app_password
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      REDIS_CACHE_URL: redis://redis:6379/1
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - ragnote
+
+  userservice:
+    build:
+      context: ./DjangoUserService
+      dockerfile: Dockerfile
+    image: ragnote-userservice:dev
+    container_name: ragnote-userservice
+    restart: unless-stopped
+    mem_limit: 256m
+    env_file:
+      - ./DjangoUserService/.env
+    environment:
+      DJANGO_ENV: development
+      DJANGO_LOAD_DOTENV: "false"
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: user_service
+      DB_USER: rag
+      DB_PASSWORD: rag_app_password
+
+      # 包含容器服务名与经代理访问的主机名。
+      DJANGO_ALLOWED_HOSTS: userservice,localhost,127.0.0.1,backend,nginx
+      DJANGO_CORS_ALLOWED_ORIGINS: http://localhost:8080,http://127.0.0.1:8080,http://localhost:5173
+      DJANGO_CSRF_TRUSTED_ORIGINS: http://localhost:8080,http://127.0.0.1:8080
+
+      # Redis 逻辑库：0=Celery，1=Django 缓存，3=FastAPI 缓存。
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      REDIS_CACHE_URL: redis://redis:6379/1
+      PYTHONUNBUFFERED: "1"
+
+    # 与 Nginx 共享头像数据；Nginx 只读挂载。
+    volumes:
+      - media_data:/app/media
+
+    # /docs/ 仅检查 HTTP 服务，不代表数据库就绪。
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/docs/',timeout=5).status==200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      start_period: 30s
+      retries: 5
+
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      usermigrate:
+        condition: service_completed_successfully
+    networks:
+      - ragnote
+
+  celery:
+    image: ragnote-userservice:dev
+    container_name: ragnote-celery
+    restart: unless-stopped
+    mem_limit: 256m
+    command: ["celery", "-A", "DjangoUserService", "worker",
+              "-l", "INFO", "-Q", "celery,default,email",
+              "--concurrency", "2"]
+    env_file:
+      - ./DjangoUserService/.env
+    environment:
+      DJANGO_ENV: development
+      DJANGO_LOAD_DOTENV: "false"
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: user_service
+      DB_USER: rag
+      DB_PASSWORD: rag_app_password
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      REDIS_CACHE_URL: redis://redis:6379/1
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - media_data:/app/media
+    depends_on:
+      redis:
+        condition: service_healthy
+      usermigrate:
+        condition: service_completed_successfully
+    networks:
+      - ragnote
+
+  nginx:
+    build:
+      context: ./front
+      dockerfile: Dockerfile
+    image: ragnote-nginx:dev
+    container_name: ragnote-nginx
+    restart: unless-stopped
+    mem_limit: 64m
+    # 对外入口；仅本机使用时需绑定回环地址。
+    ports:
+      - "8080:80"
+    volumes:
+      - media_data:/media:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+      userservice:
+        condition: service_healthy
+    networks:
+      - ragnote
+
+# 数据卷保留运行数据，删除卷会导致数据丢失。
+volumes:
+  mysql_data:
+  redis_data:
+  chroma_data:
+  blob_data:
+  md5_data:
+  images_data:
+  media_data:
+
+networks:
+  ragnote:
+    driver: bridge

@@ -9,7 +9,7 @@
         <van-cell title="头像" center is-link @click="showAvatarDialog">
           <template #right-icon>
             <div v-if="userInfo?.avatar" class="profile-avatar">
-              <van-image round width="60" height="60" :src="`http://localhost:8001${userInfo.avatar}`" />
+              <van-image round width="60" height="60" :src="userInfo.avatar" />
             </div>
             <div v-else class="profile-avatar-letter">
               {{ (userInfo?.username || '?')[0].toUpperCase() }}
@@ -537,7 +537,7 @@ const showPhoneDialog = () => {
 
 const showAvatarDialog = () => {
   const selectedFile = ref(null);
-  const previewUrl = ref(userInfo.value?.avatar ? `http://localhost:8001${userInfo.value.avatar}` : '');
+  const previewUrl = ref(userInfo.value?.avatar || '');
   
   showDialog({
     title: '修改头像',
